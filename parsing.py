@@ -30,8 +30,9 @@ _NUMBER_RE = re.compile(
     \s*\$?\s*
     (?P<neg2>-)?
     (?P<num>[\d,]*\.?\d+)
+    (?P<exp>[eE][+-]?\d+)?
     \s*
-    (?P<suffix>[kKmMbB])?
+    (?P<suffix>[kKmMbB](?![A-Za-z]))?
     """,
     re.VERBOSE,
 )
@@ -165,9 +166,18 @@ def parse_date_percentiles(text: str) -> list[DatePercentile] | None:
 def _parse_number(raw: str) -> float | None:
     """Parse a numeric-percentile value: commas, k/M/B suffixes, a
     leading $ (before or after a negative sign), and trailing units are
-    all tolerated; anything without at least one digit fails."""
+    all tolerated; anything without at least one digit fails. A k/M/B
+    suffix only counts as a multiplier when it isn't immediately
+    followed by another letter (so "30 minutes" and "120 kg" are left
+    as plain 30 / 120, not misread as 30e6 / 120e3). Scientific
+    notation (e.g. "1.2e6") is rejected -- returning None here signals
+    the caller's line as invalid, which fails the overall percentile
+    parse and falls back to the LLM's structure_output path, which is
+    explicitly instructed to convert scientific notation."""
     match = _NUMBER_RE.match(raw.strip())
     if not match or not match.group("num"):
+        return None
+    if match.group("exp"):
         return None
     try:
         value = float(match.group("num").replace(",", ""))

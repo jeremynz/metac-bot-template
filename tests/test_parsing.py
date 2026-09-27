@@ -160,6 +160,16 @@ NUMERIC_VALID_FIXTURES = [
         _NUMERIC_TEMPLATE.format(p10=-50, p20=-40, p40=-30, p60=-20, p80=-10, p90=0),
         [-50, -40, -30, -20, -10, 0],
     ),
+    (
+        "trailing_unit_starting_with_suffix_letter",
+        # "minutes"/"kg" start with k/m/b -- must NOT be misread as a
+        # 1e3/1e6 multiplier (project-backlog#613 review round 1).
+        _NUMERIC_TEMPLATE.format(
+            p10="10 minutes", p20="20 minutes", p40="30 minutes",
+            p60="40 kg", p80="50 kg", p90="60 kg",
+        ),
+        [10, 20, 30, 40, 50, 60],
+    ),
 ]
 
 NUMERIC_INVALID_FIXTURES = [
@@ -175,6 +185,15 @@ NUMERIC_INVALID_FIXTURES = [
         _NUMERIC_TEMPLATE.format(p10=100, p20=50, p40=300, p60=400, p80=500, p90=600),
     ),
     ("junk_text", "The forecast is too uncertain to give any numbers."),
+    (
+        "scientific_notation",
+        # "1.2e6" must not silently parse as 1.2 (dropping "e6" as a
+        # tolerated trailing unit) -- must fail so the LLM fallback,
+        # which is instructed to convert scientific notation, runs.
+        _NUMERIC_TEMPLATE.format(
+            p10="1.0e6", p20="1.2e6", p40="1.4e6", p60="1.6e6", p80="1.8e6", p90="2.0e6"
+        ),
+    ),
 ]
 
 
