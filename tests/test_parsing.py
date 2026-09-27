@@ -170,6 +170,19 @@ NUMERIC_VALID_FIXTURES = [
         ),
         [10, 20, 30, 40, 50, 60],
     ),
+    (
+        "magnitude_words",
+        # "N million"/"N billion" -- the letter-suffix lookahead
+        # (?![A-Za-z]) rejects "m" of "million" as a bare multiplier,
+        # so the magnitude word itself must be matched and scaled
+        # correctly instead of being dropped as a trailing unit
+        # (project-backlog#613 review round 2).
+        _NUMERIC_TEMPLATE.format(
+            p10="1 thousand", p20="2 million", p40="1.5 billion",
+            p60="2 trillion", p80="3 trillion", p90="4 trillion",
+        ),
+        [1_000, 2_000_000, 1_500_000_000, 2_000_000_000_000, 3_000_000_000_000, 4_000_000_000_000],
+    ),
 ]
 
 NUMERIC_INVALID_FIXTURES = [

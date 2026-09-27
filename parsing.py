@@ -32,11 +32,19 @@ _NUMBER_RE = re.compile(
     (?P<num>[\d,]*\.?\d+)
     (?P<exp>[eE][+-]?\d+)?
     \s*
-    (?P<suffix>[kKmMbB](?![A-Za-z]))?
+    (?P<suffix>[kKmMbB](?![A-Za-z])|thousand\b|million\b|billion\b|trillion\b)?
     """,
-    re.VERBOSE,
+    re.VERBOSE | re.IGNORECASE,
 )
-_SUFFIX_MULTIPLIER = {"k": 1e3, "m": 1e6, "b": 1e9}
+_SUFFIX_MULTIPLIER = {
+    "k": 1e3,
+    "m": 1e6,
+    "b": 1e9,
+    "thousand": 1e3,
+    "million": 1e6,
+    "billion": 1e9,
+    "trillion": 1e12,
+}
 _DATE_LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?Z?$"
 )
@@ -164,12 +172,15 @@ def parse_date_percentiles(text: str) -> list[DatePercentile] | None:
 
 
 def _parse_number(raw: str) -> float | None:
-    """Parse a numeric-percentile value: commas, k/M/B suffixes, a
+    """Parse a numeric-percentile value: commas, k/M/B suffixes, the
+    magnitude words "thousand"/"million"/"billion"/"trillion", a
     leading $ (before or after a negative sign), and trailing units are
     all tolerated; anything without at least one digit fails. A k/M/B
-    suffix only counts as a multiplier when it isn't immediately
+    letter suffix only counts as a multiplier when it isn't immediately
     followed by another letter (so "30 minutes" and "120 kg" are left
-    as plain 30 / 120, not misread as 30e6 / 120e3). Scientific
+    as plain 30 / 120, not misread as 30e6 / 120e3) -- that lookahead is
+    exactly what lets "2 million" fall through to the word-multiplier
+    alternative instead of being misread as plain 2. Scientific
     notation (e.g. "1.2e6") is rejected -- returning None here signals
     the caller's line as invalid, which fails the overall percentile
     parse and falls back to the LLM's structure_output path, which is
