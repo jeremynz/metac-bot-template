@@ -157,17 +157,7 @@ is turned off for this mode) so you get cost log lines on every invocation.
 
 ## Reviewing how your bot did
 
-Once your questions start resolving, the community-member-maintained optional
-[bot-review](https://github.com/LouisP96/metaculus-bot-review) integration scores them and
-helps to diagnose any reasoning errors.
-
-```bash
-poetry install --with integrations
-poetry run bot-review review --resolved-since 30
-```
-
-A weekly workflow and a Claude Code skill come with it. See the
-[integrations README](integrations/README.md#bot-review).
+bot-review integration removed: incompatible with forecasting-tools 0.3.x (see project-backlog#612).
 
 ## Example usage of /news and /deepnews:
 If you are using AskNews, here is some useful example code.
