@@ -1,12 +1,22 @@
 """
-Backtest harness for `FableForecastBot` (main.py) against already-resolved
-Metaculus questions -- gate G0 evidence (project-backlog#601).
+Backtest harness for `FableForecastBot` (main.py) against OPEN, main-site
+Metaculus questions -- gate G0 evidence (project-backlog#601, corrected by
+#616 to fix outcome leakage: the #601 version forecast on resolved
+questions and scored against their long-converged community prediction,
+which both trivializes the score and lets live research find the actual
+outcome).
 
 Rules this file exists to respect:
-  - Only ever fetches questions with status "resolved" and refuses (raises)
-    if any question's `close_time` isn't safely in the past -- see
-    `guard_against_open_questions`. Never publishes
+  - Uses Metaculus's own Benchmarker method (`MetaculusClient.
+    get_benchmark_questions`'s `ApiFilter`, forecasting_tools 0.3.1):
+    open, main-site, binary questions with a real community prediction and
+    >=30 forecasters, sampled randomly. Never publishes
     (`publish_reports_to_metaculus=False` is hardcoded below, not a flag).
+  - Refuses (raises) any question that belongs to a bot or cup tournament
+    (FutureEval/AIB, MiniBench, Market Pulse, Metaculus Cup) before any LLM
+    call -- see `guard_against_tournament_questions`. Only *tournament*
+    questions are forbidden; the tournament rules explicitly allow testing
+    against main-site questions.
   - Drives the existing `main.FableForecastBot` unmodified. It only ever
     swaps the bot's `llms=` config per `--config`; no prompt or aggregation
     change lands in main.py.
@@ -19,7 +29,8 @@ Rules this file exists to respect:
     `MonetaryCostManager` directly -- the same primitives Benchmarker
     itself uses internally -- and reproduces `BinaryReport`'s own
     `expected_baseline_score`/Brier formulas (data_models/binary_report.py)
-    against our own ensemble prediction (see `score_prediction` below).
+    against our own ensemble prediction (see `score_prediction` below),
+    scored vs the question's *current* community prediction.
 
 Usage:
     poetry run python backtest.py --questions 30 --config A --max-usd 5
@@ -39,6 +50,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
+
+from forecasting_tools import ApiFilter, MetaculusClient
 
 REQUIRED_ENV_VAR = "OPENROUTER_API_KEY"
 
@@ -87,37 +100,84 @@ def build_models_for_config(config: str) -> list[ModelSpec]:
 
 
 # ---------------------------------------------------------------------------
-# Open-question guard (stop condition: never forecast on open questions).
+# Tournament guard (stop condition: never forecast on a bot/cup tournament
+# question -- open main-site questions are fine, per project-backlog#616).
 # ---------------------------------------------------------------------------
 
 
-class OpenQuestionError(RuntimeError):
-    """Raised when a question intended for backtesting isn't safely closed."""
+class TournamentQuestionError(RuntimeError):
+    """Raised when a question intended for backtesting belongs to a bot or
+    cup tournament, or its tournament membership can't be determined at all."""
 
 
-def guard_against_open_questions(questions: Sequence, now: datetime | None = None) -> None:
+# The four "current" bot/cup tournament identifiers this guard refuses --
+# sourced directly from forecasting_tools.helpers.metaculus_client.
+# MetaculusClient (0.3.1) rather than hardcoded, since these rotate every
+# season. Two are numeric project ids, two are string slugs -- see the
+# comment in guard_against_tournament_questions below for how each type is
+# matched against a question.
+FORBIDDEN_TOURNAMENT_IDS: tuple[str | int, ...] = (
+    MetaculusClient.CURRENT_AI_COMPETITION_ID,  # FutureEval/AIB, e.g. 33121 (int project id)
+    MetaculusClient.CURRENT_MINIBENCH_ID,  # "minibench" (string slug)
+    MetaculusClient.CURRENT_METACULUS_CUP_ID,  # Metaculus Cup, e.g. 33108 (int project id)
+    MetaculusClient.CURRENT_MARKET_PULSE_ID,  # e.g. "market-pulse-26q4" (string slug)
+)
+
+
+def guard_against_tournament_questions(questions: Sequence) -> None:
     """
-    Refuses (raises OpenQuestionError) if any question's `close_time` is
-    missing or in the future, or its `state` is explicitly "open"/"upcoming".
-    A missing close_time can't be proven closed, so it's refused too --
-    gate G0's "never forecast on open questions" rule has no exceptions.
+    Refuses (raises TournamentQuestionError) any question that belongs to a
+    bot or cup tournament -- the tournament rules forbid backtesting against
+    open FutureEval/AIB, MiniBench, Market Pulse or Metaculus Cup questions,
+    even though open main-site questions are explicitly allowed. Must run
+    before any LLM call.
+
+    Tournament membership comes from two `MetaculusQuestion` fields exposed
+    by forecasting_tools 0.3.1 (data_models/questions.py:99-100):
+      - `tournament_slugs: list[str]` -- string slugs (e.g. "minibench"),
+        populated from the API's `projects.tournament` /
+        `projects.question_series` lists (questions.py:143-151).
+      - `default_project_id: int | None` -- the numeric id of the
+        question's default project (`projects.default_project.id`,
+        questions.py:194-198); this is what lines up with the *integer*
+        tournament ids (`CURRENT_AI_COMPETITION_ID`,
+        `CURRENT_METACULUS_CUP_ID`), which `tournament_slugs` (string
+        slugs) never will.
+    Both are checked against `FORBIDDEN_TOURNAMENT_IDS` above, plus a
+    `page_url` check for a "/tournament/" URL as a second, independent net.
+
+    If a question object exposes neither field at all, this refuses to
+    guess and raises -- ticket #616's stop condition ("if question objects
+    don't expose tournament membership, stop and report").
     """
-    now = now or datetime.now(timezone.utc)
     offenders = []
     for question in questions:
-        close_time = getattr(question, "close_time", None)
-        state = getattr(question, "state", None)
-        state_value = getattr(state, "value", state)
-        is_open_state = state_value in ("open", "upcoming")
-        if close_time is None or close_time > now or is_open_state:
+        if not hasattr(question, "tournament_slugs") and not hasattr(
+            question, "default_project_id"
+        ):
+            raise TournamentQuestionError(
+                "Question object exposes no tournament-membership field "
+                "(tournament_slugs/default_project_id) -- refusing to guess; "
+                "see project-backlog#616 stop condition."
+            )
+        tournament_slugs = list(getattr(question, "tournament_slugs", None) or [])
+        default_project_id = getattr(question, "default_project_id", None)
+        page_url = getattr(question, "page_url", None) or ""
+
+        is_forbidden = (
+            "/tournament/" in page_url
+            or default_project_id in FORBIDDEN_TOURNAMENT_IDS
+            or any(str(tid) in tournament_slugs for tid in FORBIDDEN_TOURNAMENT_IDS)
+        )
+        if is_forbidden:
             offenders.append(
                 getattr(question, "id_of_question", None)
                 or getattr(question, "page_url", "<unknown question>")
             )
     if offenders:
-        raise OpenQuestionError(
-            f"Refusing to backtest on {len(offenders)} question(s) not safely "
-            f"closed (missing/future close_time or open/upcoming state): {offenders}"
+        raise TournamentQuestionError(
+            f"Refusing to backtest on {len(offenders)} question(s) that "
+            f"belong to a bot/cup tournament: {offenders}"
         )
 
 
@@ -226,7 +286,7 @@ def render_markdown_table(results: Sequence[BacktestResult]) -> str:
     """Markdown table from one or more BacktestResult -- pure, no network,
     matches deliverable #1's column list exactly."""
     header = (
-        "| config | questions | baseline score | brier vs community | "
+        "| config | questions | baseline score | brier vs current community prediction | "
         "mean $/question | max $/question | wall time |"
     )
     separator = "|---|---|---|---|---|---|---|"
@@ -263,19 +323,24 @@ def write_result_json(result: BacktestResult, results_dir: Path = RESULTS_DIR) -
 # ---------------------------------------------------------------------------
 
 
-async def fetch_resolved_binary_questions(num_questions: int):
-    """Resolved (closed + scored) binary questions from the main site --
-    NOT `MetaculusClient.get_benchmark_questions`, which as shipped in
-    forecasting-tools 0.3.1 filters `allowed_statuses=["open"]` (see
-    helpers/metaculus_client.py) and would violate the never-forecast-on-
-    open-questions rule. Applies `guard_against_open_questions` as a second,
-    independent safety net regardless of what the API filter returns."""
-    from forecasting_tools import ApiFilter, MetaculusClient
-
+async def fetch_open_binary_questions(num_questions: int):
+    """Open, main-site binary questions -- Metaculus's own Benchmarker
+    method. Rebuilds the exact `ApiFilter`
+    `MetaculusClient.get_benchmark_questions` itself builds (forecasting-
+    tools 0.3.1, helpers/metaculus_client.py:468-477:
+    `allowed_statuses=["open"]`, `allowed_types=["binary"]`,
+    `includes_bots_in_aggregates=False`, `community_prediction_exists=True`,
+    `num_forecasters_gte=30`) rather than calling that method directly,
+    since it calls `asyncio.run` internally and can't be awaited from this
+    already-running event loop. Applies `guard_against_tournament_questions`
+    as a second, independent safety net regardless of what the API filter
+    returns -- only bot/cup tournament questions are forbidden; the
+    tournament rules explicitly allow testing against main-site questions."""
     client = MetaculusClient()
     api_filter = ApiFilter(
-        allowed_statuses=["resolved"],
+        allowed_statuses=["open"],
         allowed_types=["binary"],
+        includes_bots_in_aggregates=False,
         community_prediction_exists=True,
         num_forecasters_gte=30,
     )
@@ -284,7 +349,7 @@ async def fetch_resolved_binary_questions(num_questions: int):
         num_questions=num_questions,
         randomly_sample=True,
     )
-    guard_against_open_questions(questions)
+    guard_against_tournament_questions(questions)
     return questions
 
 
@@ -346,6 +411,9 @@ async def run_backtest_for_config(config: str, questions: Sequence, max_usd: flo
             partial = True
             continue
         ensemble_prediction = statistics.median(predictions)
+        # Question is open (fetched via fetch_open_binary_questions), so
+        # this is the *current* community prediction, not a converged
+        # resolved-question value (project-backlog#616).
         community_prediction = getattr(question, "community_prediction_at_access_time", None)
         brier, baseline_score = score_prediction(ensemble_prediction, community_prediction)
         question_results.append(
@@ -370,7 +438,7 @@ async def run_backtest_for_config(config: str, questions: Sequence, max_usd: flo
 
 
 async def _run(args: argparse.Namespace) -> BacktestResult:
-    questions = await fetch_resolved_binary_questions(args.questions)
+    questions = await fetch_open_binary_questions(args.questions)
     result = await run_backtest_for_config(args.config, questions, args.max_usd)
     write_result_json(result)
     return result
@@ -379,13 +447,14 @@ async def _run(args: argparse.Namespace) -> BacktestResult:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Backtest FableForecastBot against already-resolved Metaculus "
-            "questions (gate G0 evidence). Never forecasts on open "
-            "questions and never publishes."
+            "Backtest FableForecastBot against open, main-site Metaculus "
+            "questions (gate G0 evidence), scored vs the current community "
+            "prediction. Never forecasts on a bot/cup tournament question "
+            "and never publishes."
         )
     )
     parser.add_argument(
-        "--questions", type=int, default=30, help="Number of resolved binary questions to sample (default: 30)"
+        "--questions", type=int, default=30, help="Number of open, main-site binary questions to sample (default: 30)"
     )
     parser.add_argument(
         "--config", type=str, required=True, choices=sorted(CONFIGS), help="Model config to backtest"

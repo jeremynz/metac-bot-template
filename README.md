@@ -159,13 +159,33 @@ is turned off for this mode) so you get cost log lines on every invocation.
 
 bot-review integration removed: incompatible with forecasting-tools 0.3.x (see project-backlog#612).
 
-## Backtesting on resolved questions (gate G0)
+## Backtesting on open main-site questions (gate G0)
 
-`backtest.py` runs `FableForecastBot` (unmodified) against already-resolved
-binary questions from the main Metaculus site -- never open FutureEval or
-MiniBench questions, and never publishes (`publish_reports_to_metaculus`
-stays `False`). It's how gate G0 gets real numbers before the season
-instead of guessing.
+`backtest.py` runs `FableForecastBot` (unmodified) against **open,
+main-site** binary questions -- Metaculus's own Benchmarker method
+(`MetaculusClient.get_benchmark_questions`'s filter), never published
+(`publish_reports_to_metaculus` stays `False`). It's how gate G0 gets real
+numbers before the season instead of guessing.
+
+**Why open main-site questions, not resolved ones (project-backlog#616):**
+an earlier version of this harness forecast on *resolved* questions and
+scored against `community_prediction_at_access_time` -- but for a resolved
+question that value has already converged to near 0 or 1, and live
+research (AskNews/Kimi) can find reporting of the actual outcome, so the
+"backtest" leaked the answer to itself. Forecasting on open questions and
+scoring against the *current* community prediction is Metaculus's own
+Benchmarker method, and the tournament rules explicitly allow it: "it is
+acceptable to ... test against questions on the main site."
+
+**Never tournament questions, never publish:** only OPEN **main-site**
+questions are fair game. Open questions in a bot or cup tournament --
+FutureEval/AIB, MiniBench, Market Pulse, the Metaculus Cup -- stay
+forbidden; `guard_against_tournament_questions` refuses (raises) any such
+question before a single LLM call, checking each question's
+`tournament_slugs`/`default_project_id` (forecasting_tools 0.3.1) against
+the four tournaments' current ids, plus a `page_url` check. This harness
+never publishes a report either way (`publish_reports_to_metaculus=False`,
+hardcoded, not a flag).
 
 ```bash
 poetry run python backtest.py --questions 30 --config A --max-usd 5
@@ -178,7 +198,7 @@ poetry run python backtest.py --questions 30 --config A --max-usd 5
   - **B** -- Opus 5 judge x5 samples
   - **C** -- Sonnet 5 x3 + Opus 5 x2 (median)
   - **D** -- model-diverse: Sonnet 5 x2 + `openrouter/moonshotai/kimi-k3` x2 + Haiku 4.5 x1 (median)
-- `--questions N` (default 30) is how many resolved binary questions to sample.
+- `--questions N` (default 30) is how many open, main-site binary questions to sample.
 - `--max-usd` (default 5.0) is a hard spend cap for the whole run
   (`MonetaryCostManager`); once hit, in-flight questions are allowed to
   finish but no new LLM calls start, and the result is written with
@@ -189,8 +209,8 @@ local evidence, not committed) and a markdown table printed to stdout with
 these columns: `config`, `questions`, expected baseline score
 (the metric `forecasting_tools`'s own `BinaryReport.expected_baseline_score`
 uses -- see the note below on why this is computed directly rather than
-via `Benchmarker`), Brier score vs the community prediction at question
-close, mean and max US$ per question, and wall time.
+via `Benchmarker`), Brier score vs the **current** community prediction,
+mean and max US$ per question, and wall time.
 
 **How to read the table:** higher baseline score is better (it rewards a
 confident, correct call and punishes a confident, wrong one); lower Brier
@@ -208,12 +228,11 @@ real.
 directly**, even though it's the obvious tool for this: importing it pulls
 in `BenchmarkForBot` -> `CustomizableBot` -> `agent_wrappers`, which needs
 the optional `openai-agents` package -- not a dependency this repo
-declares, and adding it is out of scope for this backtest harness. Nor
-does `MetaculusClient.get_benchmark_questions` work here: as shipped in
-forecasting-tools 0.3.1 it filters `allowed_statuses=["open"]` (fine for
-its own use-case -- picking a live benchmark -- but exactly what this
-harness must never forecast on). `backtest.py` instead fetches
-`allowed_statuses=["resolved"]` questions itself and drives
+declares, and adding it is out of scope for this backtest harness.
+`backtest.py` instead rebuilds the exact `ApiFilter`
+`MetaculusClient.get_benchmark_questions` itself builds
+(`allowed_statuses=["open"]`, `includes_bots_in_aggregates=False`,
+`community_prediction_exists=True`, `num_forecasters_gte=30`) and drives
 `ForecastBot.forecast_questions` + `MonetaryCostManager` directly -- the
 same primitives `Benchmarker` itself uses internally -- then reproduces
 `BinaryReport`'s own scoring formula against the ensemble prediction.
@@ -222,7 +241,7 @@ same primitives `Benchmarker` itself uses internally -- then reproduces
 one-line message naming the missing variable, no traceback. There's no
 inference key in CI or this repo's sandbox yet (sponsored credits
 pending) -- `tests/test_backtest.py` covers table rendering, the
-open-question guard, each config's model list, and this exit path without
+tournament guard, each config's model list, and this exit path without
 any network call; the first real run happens once a key is available.
 
 ## Example usage of /news and /deepnews:
