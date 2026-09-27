@@ -1,0 +1,263 @@
+"""Deterministic parse-first helpers (project-backlog#613).
+
+`main.py`'s four `_run_forecast_on_*` methods already require a fixed
+final-answer format from the forecasting prompt (`Probability: ZZ%`,
+`Percentile 10: XX`, ...). These functions parse that fixed format
+directly, without an LLM call, and return the matching
+`forecasting_tools` type -- or `None` when the text fails validation,
+which signals the caller to fall back to the existing `structure_output`
+LLM-parser path unchanged.
+
+Pure functions: no network, no LLM, no side effects.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+
+from forecasting_tools import BinaryPrediction, DatePercentile, Percentile, PredictedOptionList
+from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+
+REQUIRED_PERCENTILES = (10, 20, 40, 60, 80, 90)
+
+_BINARY_RE = re.compile(r"Probability:\s*(\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
+_PERCENTILE_LINE_RE = re.compile(r"Percentile\s*(\d+)\s*:\s*(.+)", re.IGNORECASE)
+_OPTION_LINE_RE = re.compile(r"^(?P<name>.+?)\s*:\s*(?P<value>-?\$?[\d,]*\.?\d+)\s*%?\s*$")
+_NUMBER_RE = re.compile(
+    r"""^\s*
+    (?P<neg1>-)?
+    \s*\$?\s*
+    (?P<neg2>-)?
+    (?P<num>[\d,]*\.?\d+)
+    (?P<exp>[eE][+-]?\d+)?
+    \s*
+    (?P<suffix>[kKmMbB](?![A-Za-z])|thousand\b|million\b|billion\b|trillion\b)?
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+_SUFFIX_MULTIPLIER = {
+    "k": 1e3,
+    "m": 1e6,
+    "b": 1e9,
+    "thousand": 1e3,
+    "million": 1e6,
+    "billion": 1e9,
+    "trillion": 1e12,
+}
+_DATE_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?Z?$"
+)
+
+
+def parse_binary(text: str) -> BinaryPrediction | None:
+    """Use the LAST "Probability: X%" match. X must be in [0, 100]."""
+    matches = _BINARY_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        value = float(matches[-1])
+    except ValueError:
+        return None
+    if not (0 <= value <= 100):
+        return None
+    try:
+        return BinaryPrediction(prediction_in_decimal=value / 100)
+    except Exception:
+        return None
+
+
+def parse_multiple_choice(text: str, options: list[str]) -> PredictedOptionList | None:
+    """Every option must be present (exact or case-insensitive name match).
+    Probabilities must be >=0 and are normalised to sum to 1. A missing
+    option means None."""
+    parsed: dict[str, float] = {}
+    for raw_line in text.splitlines():
+        match = _OPTION_LINE_RE.match(raw_line.strip())
+        if not match:
+            continue
+        value = _parse_number(match.group("value"))
+        if value is None:
+            continue
+        parsed[match.group("name").strip()] = value
+
+    probabilities: list[float] = []
+    for option in options:
+        if option in parsed:
+            value = parsed[option]
+        else:
+            value = None
+            for name, candidate in parsed.items():
+                if name.lower() == option.lower():
+                    value = candidate
+                    break
+        if value is None or value < 0:
+            return None
+        probabilities.append(value)
+
+    total = sum(probabilities)
+    if total <= 0:
+        return None
+    normalized = [value / total for value in probabilities]
+    try:
+        return PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name=option, probability=probability)
+                for option, probability in zip(options, normalized)
+            ]
+        )
+    except Exception:
+        return None
+
+
+def parse_numeric_percentiles(text: str) -> list[Percentile] | None:
+    """All six percentiles (10/20/40/60/80/90) must be present and
+    strictly increasing. Handles commas, k/M suffixes, a leading $ and
+    trailing units, and negatives."""
+    found: dict[int, float] = {}
+    for raw_line in text.splitlines():
+        match = _PERCENTILE_LINE_RE.search(raw_line)
+        if not match:
+            continue
+        percentile = int(match.group(1))
+        if percentile not in REQUIRED_PERCENTILES:
+            continue
+        value = _parse_number(match.group(2))
+        if value is None:
+            continue
+        found[percentile] = value
+
+    if any(percentile not in found for percentile in REQUIRED_PERCENTILES):
+        return None
+    values = [found[percentile] for percentile in REQUIRED_PERCENTILES]
+    if not all(earlier < later for earlier, later in zip(values, values[1:])):
+        return None
+    try:
+        return [
+            Percentile(percentile=percentile / 100, value=value)
+            for percentile, value in zip(REQUIRED_PERCENTILES, values)
+        ]
+    except Exception:
+        return None
+
+
+def parse_date_percentiles(text: str) -> list[DatePercentile] | None:
+    """All six percentiles must be present, ISO dates, strictly
+    increasing."""
+    found: dict[int, datetime] = {}
+    for raw_line in text.splitlines():
+        match = _PERCENTILE_LINE_RE.search(raw_line)
+        if not match:
+            continue
+        percentile = int(match.group(1))
+        if percentile not in REQUIRED_PERCENTILES:
+            continue
+        value = _parse_date(match.group(2))
+        if value is None:
+            continue
+        found[percentile] = value
+
+    if any(percentile not in found for percentile in REQUIRED_PERCENTILES):
+        return None
+    values = [found[percentile] for percentile in REQUIRED_PERCENTILES]
+    if not all(earlier < later for earlier, later in zip(values, values[1:])):
+        return None
+    try:
+        return [
+            DatePercentile(percentile=percentile / 100, value=value)
+            for percentile, value in zip(REQUIRED_PERCENTILES, values)
+        ]
+    except Exception:
+        return None
+
+
+def _parse_number(raw: str) -> float | None:
+    """Parse a numeric-percentile value: commas, k/M/B suffixes, the
+    magnitude words "thousand"/"million"/"billion"/"trillion", a
+    leading $ (before or after a negative sign), and trailing units are
+    all tolerated; anything without at least one digit fails. A k/M/B
+    letter suffix only counts as a multiplier when it isn't immediately
+    followed by another letter (so "30 minutes" and "120 kg" are left
+    as plain 30 / 120, not misread as 30e6 / 120e3) -- that lookahead is
+    exactly what lets "2 million" fall through to the word-multiplier
+    alternative instead of being misread as plain 2. Scientific
+    notation (e.g. "1.2e6") is rejected -- returning None here signals
+    the caller's line as invalid, which fails the overall percentile
+    parse and falls back to the LLM's structure_output path, which is
+    explicitly instructed to convert scientific notation."""
+    match = _NUMBER_RE.match(raw.strip())
+    if not match or not match.group("num"):
+        return None
+    if match.group("exp"):
+        return None
+    try:
+        value = float(match.group("num").replace(",", ""))
+    except ValueError:
+        return None
+    suffix = match.group("suffix")
+    if suffix:
+        value *= _SUFFIX_MULTIPLIER[suffix.lower()]
+    if match.group("neg1") or match.group("neg2"):
+        value = -value
+    return value
+
+
+def numeric_percentiles_within_bounds(
+    percentiles: list[Percentile],
+    lower_bound: float,
+    upper_bound: float,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+) -> bool:
+    """True when every parsed percentile value is plausible for the
+    question's declared bounds -- the deterministic numeric parser's
+    guard against a silent unit-scale mismatch (project-backlog#613
+    round 3): `_parse_number` expands suffixes/magnitude words (e.g.
+    "$500M" -> 5e8) but has no idea the question's units are
+    themselves scaled (e.g. unit_of_measure "B $", where the answer
+    should be parsed as 0.5), so a well-formed six-percentile block
+    can still be 1e3-1e9x off. `structure_output`'s LLM fallback is
+    given the question's unit_of_measure and told to convert into it,
+    so it doesn't have this failure mode -- falling back there is the
+    fix, not trying to reimplement unit conversion here.
+
+    A CLOSED bound is a hard constraint on the real outcome (the
+    prompt tells the forecasting LLM as much -- "The outcome can not
+    be higher/lower than ..."), so any parsed value outside it is
+    already invalid regardless of units. An OPEN bound is only a soft
+    steer ("the question creator thinks ..."), so it tolerates a wide
+    margin past the stated edge -- generous enough for a legitimate
+    forecast that reasonably extends past a soft bound, but nowhere
+    near generous enough to let a several-orders-of-magnitude unit
+    error through.
+    """
+    bound_range = abs(upper_bound - lower_bound)
+    if bound_range == 0:
+        bound_range = max(abs(upper_bound), abs(lower_bound), 1.0)
+    margin = bound_range * 1000
+    for percentile in percentiles:
+        value = percentile.value
+        if not open_lower_bound and value < lower_bound - max(abs(lower_bound), 1.0) * 1e-6:
+            return False
+        if not open_upper_bound and value > upper_bound + max(abs(upper_bound), 1.0) * 1e-6:
+            return False
+        if open_lower_bound and value < lower_bound - margin:
+            return False
+        if open_upper_bound and value > upper_bound + margin:
+            return False
+    return True
+
+
+def _parse_date(raw: str) -> datetime | None:
+    """Parse a strict ISO date/datetime (YYYY-MM-DD, optionally
+    T/space-separated HH:MM:SS, optional trailing Z). Always returned
+    naive (Z/timezone is dropped) so percentiles compare consistently."""
+    cleaned = raw.strip().strip("\"'")
+    match = _DATE_LINE_RE.match(cleaned)
+    if not match:
+        return None
+    date_part, time_part = match.groups()
+    try:
+        return datetime.fromisoformat(f"{date_part}T{time_part or '00:00:00'}")
+    except ValueError:
+        return None

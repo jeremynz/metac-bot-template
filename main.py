@@ -20,6 +20,14 @@ from bot_helpers import (
 
 silence_noisy_dependencies()
 
+from parsing import (
+    numeric_percentiles_within_bounds,
+    parse_binary,
+    parse_date_percentiles,
+    parse_multiple_choice,
+    parse_numeric_percentiles,
+)
+
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -88,6 +96,18 @@ def format_bot_cost_total_line(questions: int, total_usd: float) -> str:
     """Run-total companion line to format_bot_cost_line, logged once at exit."""
     mean_usd = total_usd / questions if questions else 0.0
     return f"event=bot_cost_total questions={questions} usd={total_usd:.4f} mean_usd={mean_usd:.4f}"
+
+
+def format_parse_path_line(
+    question_id: int | str | None,
+    question_type: Literal["binary", "mc", "numeric", "date"],
+    path: Literal["deterministic", "llm_fallback", "failed"],
+) -> str:
+    """One grep-able line per question (project-backlog#613): which path
+    produced the structured forecast -- the deterministic parser in
+    parsing.py, the structure_output LLM fallback, or (rare) the fallback
+    itself raising."""
+    return f"event=parse_path question_id={question_id} type={question_type} path={path}"
 
 
 class _TokenUsageTracker:
@@ -389,12 +409,22 @@ class FableForecastBot(ForecastBot):
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        question_id = question.id_of_question or question.id_of_post
+        binary_prediction = parse_binary(reasoning)
+        if binary_prediction is not None:
+            logger.info(format_parse_path_line(question_id, "binary", "deterministic"))
+        else:
+            try:
+                binary_prediction = await structure_output(
+                    reasoning,
+                    BinaryPrediction,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+            except Exception:
+                logger.info(format_parse_path_line(question_id, "binary", "failed"))
+                raise
+            logger.info(format_parse_path_line(question_id, "binary", "llm_fallback"))
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
         logger.info(
@@ -463,13 +493,23 @@ class FableForecastBot(ForecastBot):
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
+        question_id = question.id_of_question or question.id_of_post
+        predicted_option_list = parse_multiple_choice(reasoning, question.options)
+        if predicted_option_list is not None:
+            logger.info(format_parse_path_line(question_id, "mc", "deterministic"))
+        else:
+            try:
+                predicted_option_list = await structure_output(
+                    text_to_structure=reasoning,
+                    output_type=PredictedOptionList,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                    additional_instructions=parsing_instructions,
+                )
+            except Exception:
+                logger.info(format_parse_path_line(question_id, "mc", "failed"))
+                raise
+            logger.info(format_parse_path_line(question_id, "mc", "llm_fallback"))
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -559,13 +599,35 @@ class FableForecastBot(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        question_id = question.id_of_question or question.id_of_post
+        percentile_list = parse_numeric_percentiles(reasoning)
+        if percentile_list is not None and not numeric_percentiles_within_bounds(
+            percentile_list,
+            question.lower_bound,
+            question.upper_bound,
+            question.open_lower_bound,
+            question.open_upper_bound,
+        ):
+            # Well-formed six-percentile block, but implausible for the
+            # question's bounds -- most likely a unit-scale mismatch the
+            # deterministic parser can't see (project-backlog#613 round 3
+            # review). Fall back to structure_output, which is unit-aware.
+            percentile_list = None
+        if percentile_list is not None:
+            logger.info(format_parse_path_line(question_id, "numeric", "deterministic"))
+        else:
+            try:
+                percentile_list = await structure_output(
+                    reasoning,
+                    list[Percentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+            except Exception:
+                logger.info(format_parse_path_line(question_id, "numeric", "failed"))
+                raise
+            logger.info(format_parse_path_line(question_id, "numeric", "llm_fallback"))
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -649,13 +711,23 @@ class FableForecastBot(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        question_id = question.id_of_question or question.id_of_post
+        date_percentile_list = parse_date_percentiles(reasoning)
+        if date_percentile_list is not None:
+            logger.info(format_parse_path_line(question_id, "date", "deterministic"))
+        else:
+            try:
+                date_percentile_list = await structure_output(
+                    reasoning,
+                    list[DatePercentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+            except Exception:
+                logger.info(format_parse_path_line(question_id, "date", "failed"))
+                raise
+            logger.info(format_parse_path_line(question_id, "date", "llm_fallback"))
 
         percentile_list = [
             Percentile(
