@@ -8,6 +8,11 @@ module docstring for why importing here doesn't trigger any network call.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
