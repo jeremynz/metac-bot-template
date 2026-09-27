@@ -1,22 +1,29 @@
 """
-No-network tests for backtest.py (project-backlog#601): table rendering,
-the open-question guard, config->model-list building, and the missing-key
-exit path. Mirrors tests/test_config.py's style (plain pytest functions,
-stub objects instead of real network objects) -- see that file's own
-module docstring for why importing here doesn't trigger any network call.
+No-network tests for backtest.py (project-backlog#601, #616): table
+rendering, the tournament guard, the open-question-source filter, config
+->model-list building, and the missing-key exit path. Mirrors
+tests/test_config.py's style (plain pytest functions, stub objects instead
+of real network objects) -- see that file's own module docstring for why
+importing here doesn't trigger any network call. `backtest` imports
+`forecasting_tools` at module level (same as `main.py`), so this file
+transitively depends on that package being installed -- same as
+test_config.py already depends on it via `main` -- but never makes a
+network call itself: every `MetaculusClient`/`ApiFilter` use below is
+either a stub, a monkeypatched fake, or a pure in-memory pydantic object.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from datetime import datetime, timedelta, timezone
-
 import pytest
+from forecasting_tools import MetaculusClient
 
+import backtest
 from backtest import (
     CONFIGS,
     BacktestResult,
@@ -24,11 +31,12 @@ from backtest import (
     KIMI_K3,
     ModelSpec,
     OPUS_5,
-    OpenQuestionError,
     QuestionResult,
     SONNET_5,
+    TournamentQuestionError,
     build_models_for_config,
-    guard_against_open_questions,
+    fetch_open_binary_questions,
+    guard_against_tournament_questions,
     main,
     missing_env_var,
     render_markdown_table,
@@ -82,56 +90,116 @@ def test_every_config_total_samples_between_2_and_5():
 
 
 # ---------------------------------------------------------------------------
-# Open-question guard
+# Tournament guard (project-backlog#616: replaces the old open-question
+# guard now that forecasting open main-site questions is the point).
 # ---------------------------------------------------------------------------
 
 
 class _StubQuestion:
-    def __init__(self, close_time=None, state=None, id_of_question=1):
-        self.close_time = close_time
-        self.state = state
+    def __init__(
+        self,
+        id_of_question=1,
+        page_url=None,
+        tournament_slugs=None,
+        default_project_id=None,
+    ):
         self.id_of_question = id_of_question
-        self.page_url = f"https://www.metaculus.com/questions/{id_of_question}/"
+        self.page_url = page_url or f"https://www.metaculus.com/questions/{id_of_question}/"
+        self.tournament_slugs = tournament_slugs or []
+        self.default_project_id = default_project_id
 
 
-def test_guard_allows_a_question_closed_in_the_past():
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    question = _StubQuestion(close_time=now - timedelta(days=10))
-    guard_against_open_questions([question], now=now)  # must not raise
+def test_guard_allows_a_main_site_question():
+    question = _StubQuestion()
+    guard_against_tournament_questions([question])  # must not raise
 
 
-def test_guard_refuses_a_question_with_close_time_in_the_future():
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    question = _StubQuestion(close_time=now + timedelta(days=10))
-    with pytest.raises(OpenQuestionError):
-        guard_against_open_questions([question], now=now)
+def test_guard_refuses_ai_competition_futureeval_question():
+    question = _StubQuestion(default_project_id=MetaculusClient.CURRENT_AI_COMPETITION_ID)
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([question])
 
 
-def test_guard_refuses_a_question_with_no_close_time():
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    question = _StubQuestion(close_time=None)
-    with pytest.raises(OpenQuestionError):
-        guard_against_open_questions([question], now=now)
+def test_guard_refuses_minibench_question():
+    question = _StubQuestion(tournament_slugs=[MetaculusClient.CURRENT_MINIBENCH_ID])
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([question])
 
 
-def test_guard_refuses_a_question_explicitly_marked_open():
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    # Closed in the past by the clock, but still flagged "open" -- the
-    # state check is an independent second net, not just close_time.
-    question = _StubQuestion(close_time=now - timedelta(days=1), state="open")
-    with pytest.raises(OpenQuestionError):
-        guard_against_open_questions([question], now=now)
+def test_guard_refuses_metaculus_cup_question():
+    question = _StubQuestion(default_project_id=MetaculusClient.CURRENT_METACULUS_CUP_ID)
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([question])
+
+
+def test_guard_refuses_market_pulse_question():
+    question = _StubQuestion(tournament_slugs=[MetaculusClient.CURRENT_MARKET_PULSE_ID])
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([question])
+
+
+def test_guard_refuses_a_tournament_url_even_without_project_fields():
+    question = _StubQuestion(
+        page_url="https://www.metaculus.com/tournament/fall-futureeval-2026/"
+    )
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([question])
 
 
 def test_guard_reports_all_offenders_not_just_the_first():
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    good = _StubQuestion(close_time=now - timedelta(days=1), id_of_question=1)
-    bad_one = _StubQuestion(close_time=now + timedelta(days=1), id_of_question=2)
-    bad_two = _StubQuestion(close_time=None, id_of_question=3)
-    with pytest.raises(OpenQuestionError) as excinfo:
-        guard_against_open_questions([good, bad_one, bad_two], now=now)
+    good = _StubQuestion(id_of_question=1)
+    bad_one = _StubQuestion(
+        id_of_question=2, tournament_slugs=[MetaculusClient.CURRENT_MINIBENCH_ID]
+    )
+    bad_two = _StubQuestion(
+        id_of_question=3, default_project_id=MetaculusClient.CURRENT_METACULUS_CUP_ID
+    )
+    with pytest.raises(TournamentQuestionError) as excinfo:
+        guard_against_tournament_questions([good, bad_one, bad_two])
     assert "2" in str(excinfo.value)
     assert "3" in str(excinfo.value)
+
+
+def test_guard_refuses_when_question_exposes_no_tournament_field_at_all():
+    # Ticket #616 stop condition: if a question object exposes no
+    # tournament-membership field at all, refuse to guess -- don't guess.
+    class _BareQuestion:
+        id_of_question = 1
+        page_url = "https://www.metaculus.com/questions/1/"
+
+    with pytest.raises(TournamentQuestionError):
+        guard_against_tournament_questions([_BareQuestion()])
+
+
+# ---------------------------------------------------------------------------
+# Open-question-source filter (deliverable #1: allowed_statuses=["open"],
+# includes_bots_in_aggregates=False -- asserted on the real, constructed
+# ApiFilter via a monkeypatched MetaculusClient, no network).
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_open_binary_questions_builds_the_benchmarker_filter(monkeypatch):
+    captured = {}
+
+    class _FakeClient:
+        async def get_questions_matching_filter(self, api_filter, **kwargs):
+            captured["api_filter"] = api_filter
+            captured["kwargs"] = kwargs
+            return []
+
+    monkeypatch.setattr(backtest, "MetaculusClient", lambda: _FakeClient())
+
+    questions = asyncio.run(fetch_open_binary_questions(10))
+
+    assert questions == []
+    api_filter = captured["api_filter"]
+    assert api_filter.allowed_statuses == ["open"]
+    assert api_filter.allowed_types == ["binary"]
+    assert api_filter.includes_bots_in_aggregates is False
+    assert api_filter.community_prediction_exists is True
+    assert api_filter.num_forecasters_gte == 30
+    assert captured["kwargs"]["num_questions"] == 10
+    assert captured["kwargs"]["randomly_sample"] is True
 
 
 # ---------------------------------------------------------------------------
