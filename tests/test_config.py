@@ -16,6 +16,8 @@ from forecasting_tools import ForecastBot, GeneralLlm
 
 from main import (
     FableForecastBot,
+    _TokenUsageCallback,
+    _TokenUsageTracker,
     format_bot_cost_line,
     format_bot_cost_total_line,
     select_researcher,
@@ -170,3 +172,52 @@ def test_run_individual_question_logs_bot_cost_and_records_price(caplog):
         "researcher=asknews/news-summaries "
         "default=openrouter/anthropic/claude-sonnet-5"
     )
+
+
+def test_token_tracker_sees_callback_dispatched_via_real_litellm_logging_worker():
+    """
+    Review round 3, "could not verify": does litellm's ASYNC success
+    callback actually run inside the question task's context, so the
+    `_TokenUsageTracker` ContextVar (main.py:105) records into the
+    calling task's tracker rather than nothing?
+
+    litellm never awaits an async success callback inline -- for real
+    (non-fallback) async completions it routes through
+    `GLOBAL_LOGGING_WORKER` (litellm/litellm_core_utils/logging_worker.py),
+    a single long-lived background task. That worker's `enqueue()`
+    captures `contextvars.copy_context()` at enqueue time (i.e. inside
+    the caller's own task, right after the LLM call returns) and
+    `_process_log_task` then re-enters that captured context via
+    `context.run(asyncio.create_task, coroutine)` before spawning the
+    task that actually awaits the callback -- deliberately propagating
+    the calling task's contextvars into the worker-spawned task rather
+    than leaving the worker's own long-lived context in place.
+
+    This exercises that real litellm mechanism end-to-end (no mocking of
+    litellm's own worker), enqueueing `_TokenUsageCallback` directly, and
+    asserts the ContextVar `_TokenUsageTracker` opened in *this* task is
+    what receives the usage recorded from inside the worker-dispatched
+    coroutine. If a future litellm release stops preserving context here,
+    this test -- not just a live paid run -- would catch it.
+    """
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    _TokenUsageCallback.initialize()
+    fake_response = mock.Mock()
+    fake_response.usage = mock.Mock(prompt_tokens=11, completion_tokens=22)
+
+    async def scenario():
+        with _TokenUsageTracker() as tracker:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
+                _TokenUsageCallback().async_log_success_event(
+                    kwargs={}, response_obj=fake_response, start_time=None, end_time=None
+                )
+            )
+            for _ in range(200):
+                if tracker.input_tokens:
+                    break
+                await asyncio.sleep(0.01)
+        return tracker
+
+    tracker = asyncio.run(scenario())
+    assert (tracker.input_tokens, tracker.output_tokens) == (11, 22)
