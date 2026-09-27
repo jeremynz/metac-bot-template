@@ -71,6 +71,23 @@ def test_format_bot_cost_line_falls_back_to_tokens_when_unpriced():
     assert "input_tokens=1500 output_tokens=300" in line
 
 
+def test_format_bot_cost_line_falls_back_to_tokens_when_usd_rounds_to_zero():
+    # usd is nonzero but rounds to "0.0000" at 4dp -- the fallback must still
+    # fire (round(usd, 4) <= 0.0), not just the literal usd == 0.0 case above.
+    stub_report = StubReport(price_estimate=0.00004)
+    line = format_bot_cost_line(
+        question_id=8,
+        url="https://www.metaculus.com/questions/8/",
+        usd=stub_report.price_estimate,
+        researcher="openrouter/moonshotai/kimi-k3",
+        default_model="openrouter/anthropic/claude-sonnet-5",
+        input_tokens=50,
+        output_tokens=10,
+    )
+    assert "usd=0.0000" in line
+    assert "input_tokens=50 output_tokens=10" in line
+
+
 def test_format_bot_cost_total_line():
     line = format_bot_cost_total_line(questions=4, total_usd=0.80)
     assert line == "event=bot_cost_total questions=4 usd=0.8000 mean_usd=0.2000"

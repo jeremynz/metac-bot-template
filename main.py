@@ -79,7 +79,7 @@ def format_bot_cost_line(
         f"event=bot_cost question_id={question_id} url={url} "
         f"usd={usd:.4f} researcher={researcher} default={default_model}"
     )
-    if usd <= 0.0 and input_tokens is not None and output_tokens is not None:
+    if round(usd, 4) <= 0.0 and input_tokens is not None and output_tokens is not None:
         line += f" input_tokens={input_tokens} output_tokens={output_tokens}"
     return line
 
