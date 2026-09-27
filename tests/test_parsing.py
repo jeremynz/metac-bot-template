@@ -14,10 +14,11 @@ from datetime import datetime
 from unittest import mock
 
 import pytest
-from forecasting_tools import BinaryPrediction, GeneralLlm
+from forecasting_tools import BinaryPrediction, GeneralLlm, NumericQuestion, Percentile
 
 from main import FableForecastBot
 from parsing import (
+    numeric_percentiles_within_bounds,
     parse_binary,
     parse_date_percentiles,
     parse_multiple_choice,
@@ -223,6 +224,72 @@ def test_parse_numeric_percentiles_invalid(name, text):
     assert parse_numeric_percentiles(text) is None, name
 
 
+# ---------------------------------------------- numeric bounds validation ---
+# project-backlog#613 round 3 review: the deterministic numeric parser
+# doesn't know about question.unit_of_measure, so a well-formed
+# six-percentile block can still be off by whatever scale the LLM's
+# answer used vs. the question's declared units (the reviewer's own
+# example: "$500,000,000" against a "B $" bound should parse as 0.5).
+# numeric_percentiles_within_bounds is the guard that catches this
+# before the deterministic result is accepted.
+
+
+def test_numeric_percentiles_within_bounds_flags_unit_scale_mismatch():
+    """The reviewer's own example: raw dollars parsed against a 0-10
+    "B $" bound is 1e7-1e8x too large -- must be rejected."""
+    text = _NUMERIC_TEMPLATE.format(
+        p10="$100,000,000", p20="$200,000,000", p40="$400,000,000",
+        p60="$600,000,000", p80="$800,000,000", p90="$900,000,000",
+    )
+    percentiles = parse_numeric_percentiles(text)
+    assert percentiles is not None  # sanity: parses fine as plain numbers
+    assert not numeric_percentiles_within_bounds(
+        percentiles,
+        lower_bound=0,
+        upper_bound=10,
+        open_lower_bound=False,
+        open_upper_bound=True,
+    )
+
+
+def test_numeric_percentiles_within_bounds_accepts_correctly_scaled_values():
+    text = _NUMERIC_TEMPLATE.format(p10=1, p20=2, p40=4, p60=6, p80=8, p90=9)
+    percentiles = parse_numeric_percentiles(text)
+    assert numeric_percentiles_within_bounds(
+        percentiles,
+        lower_bound=0,
+        upper_bound=10,
+        open_lower_bound=False,
+        open_upper_bound=True,
+    )
+
+
+def test_numeric_percentiles_within_bounds_open_bound_tolerates_soft_overrun():
+    # Open bound is a soft steer, not a hard constraint -- a forecast that
+    # reasonably extends past it must not be treated as a scale error.
+    text = _NUMERIC_TEMPLATE.format(p10=1, p20=2, p40=4, p60=6, p80=8, p90=50)
+    percentiles = parse_numeric_percentiles(text)
+    assert numeric_percentiles_within_bounds(
+        percentiles,
+        lower_bound=0,
+        upper_bound=10,
+        open_lower_bound=False,
+        open_upper_bound=True,
+    )
+
+
+def test_numeric_percentiles_within_bounds_closed_bound_is_a_hard_constraint():
+    text = _NUMERIC_TEMPLATE.format(p10=1, p20=2, p40=4, p60=6, p80=8, p90=11)
+    percentiles = parse_numeric_percentiles(text)
+    assert not numeric_percentiles_within_bounds(
+        percentiles,
+        lower_bound=0,
+        upper_bound=10,
+        open_lower_bound=False,
+        open_upper_bound=False,
+    )
+
+
 # ------------------------------------------------------------------ date ---
 
 _DATE_TEMPLATE = (
@@ -366,4 +433,75 @@ def test_binary_prompt_to_forecast_falls_back_to_structure_output_when_parse_fai
     parse_path_lines = [line for line in caplog_records if "event=parse_path" in line]
     assert parse_path_lines == [
         "event=parse_path question_id=99 type=binary path=llm_fallback"
+    ]
+
+
+def test_numeric_prompt_to_forecast_falls_back_when_unit_scale_mismatched():
+    """project-backlog#613 round 3 review: the deterministic parse
+    produces a well-formed, monotonic six-percentile block, but the
+    values are the wrong scale for the question's "B $" unit (raw
+    dollars vs. billions) -- must fall back to the unit-aware
+    structure_output path rather than silently accepting a
+    NumericDistribution that's ~1e8x off."""
+    question = NumericQuestion(
+        question_text="How much revenue will the company report?",
+        page_url="https://www.metaculus.com/questions/100/",
+        id_of_question=100,
+        question_type="numeric",
+        unit_of_measure="B $",
+        upper_bound=10,
+        lower_bound=0,
+        open_upper_bound=True,
+        open_lower_bound=False,
+        nominal_upper_bound=None,
+        nominal_lower_bound=None,
+    )
+    bot = FableForecastBot(
+        llms={
+            "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-5"),
+            "summarizer": "openrouter/anthropic/claude-haiku-4.5",
+            "researcher": "asknews/news-summaries",
+            "parser": "openrouter/anthropic/claude-haiku-4.5",
+        },
+    )
+
+    scaled_reasoning = _NUMERIC_TEMPLATE.format(
+        p10="$100,000,000", p20="$200,000,000", p40="$400,000,000",
+        p60="$600,000,000", p80="$800,000,000", p90="$900,000,000",
+    )
+    assert parse_numeric_percentiles(scaled_reasoning) is not None  # sanity: parses as numbers
+
+    fallback_percentiles = [
+        Percentile(percentile=p / 100, value=v)
+        for p, v in zip((10, 20, 40, 60, 80, 90), (0.1, 0.2, 0.4, 0.6, 0.8, 0.9))
+    ]
+    fake_structure_output = mock.AsyncMock(return_value=fallback_percentiles)
+
+    async def fake_invoke(self, prompt):
+        return scaled_reasoning
+
+    caplog_records: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record):
+            caplog_records.append(record.getMessage())
+
+    handler = _ListHandler()
+    logging.getLogger("main").addHandler(handler)
+    logging.getLogger("main").setLevel(logging.INFO)
+    try:
+        with mock.patch.object(GeneralLlm, "invoke", fake_invoke), mock.patch(
+            "main.structure_output", fake_structure_output
+        ):
+            result = asyncio.run(
+                bot._numeric_prompt_to_forecast(question, "irrelevant prompt")
+            )
+    finally:
+        logging.getLogger("main").removeHandler(handler)
+
+    fake_structure_output.assert_awaited_once()
+    assert result.prediction_value.declared_percentiles == fallback_percentiles
+    parse_path_lines = [line for line in caplog_records if "event=parse_path" in line]
+    assert parse_path_lines == [
+        "event=parse_path question_id=100 type=numeric path=llm_fallback"
     ]

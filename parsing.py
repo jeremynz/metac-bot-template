@@ -202,6 +202,52 @@ def _parse_number(raw: str) -> float | None:
     return value
 
 
+def numeric_percentiles_within_bounds(
+    percentiles: list[Percentile],
+    lower_bound: float,
+    upper_bound: float,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+) -> bool:
+    """True when every parsed percentile value is plausible for the
+    question's declared bounds -- the deterministic numeric parser's
+    guard against a silent unit-scale mismatch (project-backlog#613
+    round 3): `_parse_number` expands suffixes/magnitude words (e.g.
+    "$500M" -> 5e8) but has no idea the question's units are
+    themselves scaled (e.g. unit_of_measure "B $", where the answer
+    should be parsed as 0.5), so a well-formed six-percentile block
+    can still be 1e3-1e9x off. `structure_output`'s LLM fallback is
+    given the question's unit_of_measure and told to convert into it,
+    so it doesn't have this failure mode -- falling back there is the
+    fix, not trying to reimplement unit conversion here.
+
+    A CLOSED bound is a hard constraint on the real outcome (the
+    prompt tells the forecasting LLM as much -- "The outcome can not
+    be higher/lower than ..."), so any parsed value outside it is
+    already invalid regardless of units. An OPEN bound is only a soft
+    steer ("the question creator thinks ..."), so it tolerates a wide
+    margin past the stated edge -- generous enough for a legitimate
+    forecast that reasonably extends past a soft bound, but nowhere
+    near generous enough to let a several-orders-of-magnitude unit
+    error through.
+    """
+    bound_range = abs(upper_bound - lower_bound)
+    if bound_range == 0:
+        bound_range = max(abs(upper_bound), abs(lower_bound), 1.0)
+    margin = bound_range * 1000
+    for percentile in percentiles:
+        value = percentile.value
+        if not open_lower_bound and value < lower_bound - max(abs(lower_bound), 1.0) * 1e-6:
+            return False
+        if not open_upper_bound and value > upper_bound + max(abs(upper_bound), 1.0) * 1e-6:
+            return False
+        if open_lower_bound and value < lower_bound - margin:
+            return False
+        if open_upper_bound and value > upper_bound + margin:
+            return False
+    return True
+
+
 def _parse_date(raw: str) -> datetime | None:
     """Parse a strict ISO date/datetime (YYYY-MM-DD, optionally
     T/space-separated HH:MM:SS, optional trailing Z). Always returned

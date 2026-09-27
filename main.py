@@ -21,6 +21,7 @@ from bot_helpers import (
 silence_noisy_dependencies()
 
 from parsing import (
+    numeric_percentiles_within_bounds,
     parse_binary,
     parse_date_percentiles,
     parse_multiple_choice,
@@ -600,6 +601,18 @@ class FableForecastBot(ForecastBot):
         )
         question_id = question.id_of_question or question.id_of_post
         percentile_list = parse_numeric_percentiles(reasoning)
+        if percentile_list is not None and not numeric_percentiles_within_bounds(
+            percentile_list,
+            question.lower_bound,
+            question.upper_bound,
+            question.open_lower_bound,
+            question.open_upper_bound,
+        ):
+            # Well-formed six-percentile block, but implausible for the
+            # question's bounds -- most likely a unit-scale mismatch the
+            # deterministic parser can't see (project-backlog#613 round 3
+            # review). Fall back to structure_output, which is unit-aware.
+            percentile_list = None
         if percentile_list is not None:
             logger.info(format_parse_path_line(question_id, "numeric", "deterministic"))
         else:
