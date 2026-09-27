@@ -159,6 +159,72 @@ is turned off for this mode) so you get cost log lines on every invocation.
 
 bot-review integration removed: incompatible with forecasting-tools 0.3.x (see project-backlog#612).
 
+## Backtesting on resolved questions (gate G0)
+
+`backtest.py` runs `FableForecastBot` (unmodified) against already-resolved
+binary questions from the main Metaculus site -- never open FutureEval or
+MiniBench questions, and never publishes (`publish_reports_to_metaculus`
+stays `False`). It's how gate G0 gets real numbers before the season
+instead of guessing.
+
+```bash
+poetry run python backtest.py --questions 30 --config A --max-usd 5
+```
+
+- `--config` picks one of four model configs (research into what wins these
+  tournaments, 2026-09-28: a median of 2-5 diverse models beats a single
+  model):
+  - **A** -- Sonnet 5 judge x5 samples (same default/judge model `main.py` ships with)
+  - **B** -- Opus 5 judge x5 samples
+  - **C** -- Sonnet 5 x3 + Opus 5 x2 (median)
+  - **D** -- model-diverse: Sonnet 5 x2 + `openrouter/moonshotai/kimi-k3` x2 + Haiku 4.5 x1 (median)
+- `--questions N` (default 30) is how many resolved binary questions to sample.
+- `--max-usd` (default 5.0) is a hard spend cap for the whole run
+  (`MonetaryCostManager`); once hit, in-flight questions are allowed to
+  finish but no new LLM calls start, and the result is written with
+  `"partial": true`.
+
+**Result:** written to `backtests/<date>-<config>.json` (gitignored --
+local evidence, not committed) and a markdown table printed to stdout with
+these columns: `config`, `questions`, expected baseline score
+(the metric `forecasting_tools`'s own `BinaryReport.expected_baseline_score`
+uses -- see the note below on why this is computed directly rather than
+via `Benchmarker`), Brier score vs the community prediction at question
+close, mean and max US$ per question, and wall time.
+
+**How to read the table:** higher baseline score is better (it rewards a
+confident, correct call and punishes a confident, wrong one); lower Brier
+is better. For a diverse config (C, D), both are computed against this
+run's own ensemble prediction -- the median across each config's per-model
+bot predictions, taken here in `backtest.py` since `main.py`'s own
+aggregation is never touched by this ticket.
+
+**G0 pass rule:** G0 passes at **<=US$0.40/question** (mean) with a score
+no worse than config A by more than noise. Compare each config's row
+against A's on the same question sample before reading a difference as
+real.
+
+**Why not `forecasting_tools.cp_benchmarking.benchmarker.Benchmarker`
+directly**, even though it's the obvious tool for this: importing it pulls
+in `BenchmarkForBot` -> `CustomizableBot` -> `agent_wrappers`, which needs
+the optional `openai-agents` package -- not a dependency this repo
+declares, and adding it is out of scope for this backtest harness. Nor
+does `MetaculusClient.get_benchmark_questions` work here: as shipped in
+forecasting-tools 0.3.1 it filters `allowed_statuses=["open"]` (fine for
+its own use-case -- picking a live benchmark -- but exactly what this
+harness must never forecast on). `backtest.py` instead fetches
+`allowed_statuses=["resolved"]` questions itself and drives
+`ForecastBot.forecast_questions` + `MonetaryCostManager` directly -- the
+same primitives `Benchmarker` itself uses internally -- then reproduces
+`BinaryReport`'s own scoring formula against the ensemble prediction.
+
+**No `OPENROUTER_API_KEY` / no network:** `backtest.py` exits `1` with a
+one-line message naming the missing variable, no traceback. There's no
+inference key in CI or this repo's sandbox yet (sponsored credits
+pending) -- `tests/test_backtest.py` covers table rendering, the
+open-question guard, each config's model list, and this exit path without
+any network call; the first real run happens once a key is available.
+
 ## Example usage of /news and /deepnews:
 If you are using AskNews, here is some useful example code.
 ```python
