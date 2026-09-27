@@ -8,7 +8,18 @@ executes the `if __name__ == "__main__":` block (so no METACULUS_TOKEN /
 OPENROUTER_API_KEY / network calls happen just by importing).
 """
 
-from main import format_bot_cost_line, format_bot_cost_total_line, select_researcher
+import asyncio
+import logging
+from unittest import mock
+
+from forecasting_tools import ForecastBot, GeneralLlm
+
+from main import (
+    FableForecastBot,
+    format_bot_cost_line,
+    format_bot_cost_total_line,
+    select_researcher,
+)
 
 
 class StubReport:
@@ -96,3 +107,66 @@ def test_format_bot_cost_total_line():
 def test_format_bot_cost_total_line_zero_questions_does_not_divide_by_zero():
     line = format_bot_cost_total_line(questions=0, total_usd=0.0)
     assert line == "event=bot_cost_total questions=0 usd=0.0000 mean_usd=0.0000"
+
+
+class _StubQuestion:
+    """Stand-in for a MetaculusQuestion: only the three attributes
+    FableForecastBot._run_individual_question reads off the question."""
+
+    id_of_question = 42
+    id_of_post = None
+    page_url = "https://www.metaculus.com/questions/42/"
+
+
+def test_run_individual_question_logs_bot_cost_and_records_price(caplog):
+    """
+    Exercises the actual SDK-override path (main.py's
+    FableForecastBot._run_individual_question), not just the pure
+    formatter it calls. Monkeypatches the PARENT
+    ForecastBot._run_individual_question -- the forecasting_tools 0.3.1
+    method this override wraps -- so no research/forecast/network runs,
+    then asserts on the logged `event=bot_cost` line and on
+    `_question_costs_usd`, closing the gap the review flagged: nothing
+    previously exercised this hook, so a signature/attribute break in
+    forecasting_tools (e.g. `price_estimate` renamed or the method
+    removed) would go undetected.
+
+    Uses asyncio.run rather than pytest-asyncio -- that plugin isn't a
+    declared dev dependency here and this test doesn't need it.
+    """
+
+    class _StubReport:
+        def __init__(self, price_estimate: float) -> None:
+            self.price_estimate = price_estimate
+
+    async def fake_parent_run_individual_question(self, question):
+        return _StubReport(price_estimate=0.1234)
+
+    bot = FableForecastBot(
+        llms={
+            "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-5"),
+            "summarizer": "openrouter/anthropic/claude-haiku-4.5",
+            "researcher": "asknews/news-summaries",
+            "parser": "openrouter/anthropic/claude-haiku-4.5",
+        },
+    )
+
+    with mock.patch.object(
+        ForecastBot,
+        "_run_individual_question",
+        fake_parent_run_individual_question,
+    ):
+        with caplog.at_level(logging.INFO, logger="main"):
+            report = asyncio.run(bot._run_individual_question(_StubQuestion()))
+
+    assert report.price_estimate == 0.1234
+    assert bot._question_costs_usd == [0.1234]
+    [logged_line] = [
+        record.message for record in caplog.records if "event=bot_cost" in record.message
+    ]
+    assert logged_line == (
+        "event=bot_cost question_id=42 "
+        "url=https://www.metaculus.com/questions/42/ usd=0.1234 "
+        "researcher=asknews/news-summaries "
+        "default=openrouter/anthropic/claude-sonnet-5"
+    )
