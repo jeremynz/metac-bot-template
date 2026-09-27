@@ -1,7 +1,17 @@
+# Runs the bot on the live tournament every 20 minutes; can also be dispatched
+# manually against the bot-testing-area questions via the `mode` input.
 name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to forecast on"
+        type: choice
+        options:
+          - tournament
+          - test_questions
+        default: tournament
   schedule:
     - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
 
@@ -20,6 +30,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: "3.11"
       - name: Install poetry
@@ -29,25 +40,23 @@ jobs:
           virtualenvs-in-project: true
           installer-parallel: true
       # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
-      # - name: Load cached venv
-      #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: .venv
-      #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Refresh lock file
+        run: poetry lock --no-update
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py
+          poetry run python main.py --mode ${{ inputs.mode || 'tournament' }}
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
