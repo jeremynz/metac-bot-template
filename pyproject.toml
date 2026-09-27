@@ -14,7 +14,7 @@ asknews = "^0.13.11"
 numpy = "^2.3.0"
 openai = "^2.0.0"
 python-dotenv = "^1.0.1"
-forecasting-tools = "^0.2.90"
+forecasting-tools = "^0.3.1"
 
 
 [tool.poetry.group.integrations]
@@ -27,6 +27,7 @@ metaculus-bot-review = "^0.1.1"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
+pytest = "^8.3.0"
 
 [build-system]
 requires = ["poetry-core"]

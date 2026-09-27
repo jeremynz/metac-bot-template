@@ -117,8 +117,43 @@ poetry run python main_with_no_framework.py
 This file has no `--mode` flag; it's controlled by the constants at the top of the file (`SUBMIT_PREDICTION`, `USE_EXAMPLE_QUESTIONS`, `TOURNAMENT_ID`, etc.). Flip `USE_EXAMPLE_QUESTIONS = True` to point it at the bot-testing-area tournament instead of the live AIB.
 
 To stop publishing forecasts (dry-run mode):
-- `main.py`: set `publish_reports_to_metaculus=False` in the `SummerTemplateBot2026(...)` constructor near the bottom.
+- `main.py`: set `publish_reports_to_metaculus=False` in the `FableForecastBot(...)` constructor near the bottom.
 - `main_with_no_framework.py`: set `SUBMIT_PREDICTION = False` at the top.
+
+## Running and cost
+
+`main.py` pins cheap-by-design OpenRouter models (`FableForecastBot`'s `llms=`
+block): `anthropic/claude-sonnet-5` as the default/judge model,
+`anthropic/claude-haiku-4.5` for parsing and summarizing, and AskNews
+(`asknews/news-summaries`) for research when both `ASKNEWS_CLIENT_ID` and
+`ASKNEWS_SECRET` are set, else `moonshotai/kimi-k3` as the fallback
+researcher. All three are priced in litellm's own cost table under their
+`openrouter/...` model ids, so `MonetaryCostManager` (already used
+internally by `ForecastBot._run_individual_question`) prices each question
+without any extra wiring here.
+
+Every question logs one line once its forecast is done:
+```
+event=bot_cost question_id=<id> url=<page_url> usd=<0.0000> researcher=<name> default=<model>
+```
+If litellm can't price a model (usd stays `0.0000`), the same line also
+carries `input_tokens=<n> output_tokens=<n>` read from litellm's response
+usage, so cost is still visible even without a priced model. Once a run
+finishes, a single total line follows:
+```
+event=bot_cost_total questions=<n> usd=<sum> mean_usd=<x>
+```
+
+**Gate G0 target: mean_usd <= US$0.40/question.** Watch these two lines in
+the run logs (or your log aggregator) to check it.
+
+To smoke-test without waiting for a live tournament window:
+```bash
+poetry run python main.py --mode test_questions
+```
+This forecasts on the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/),
+re-forecasting every question each run (`skip_previously_forecasted_questions`
+is turned off for this mode) so you get cost log lines on every invocation.
 
 ## Reviewing how your bot did
 

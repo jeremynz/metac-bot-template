@@ -1,10 +1,14 @@
 import argparse
 import asyncio
 import logging
+import os
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+import litellm
+from litellm.integrations.custom_logger import CustomLogger as LitellmCustomLogger
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -45,7 +49,122 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class SummerTemplateBot2026(ForecastBot):
+def select_researcher(asknews_client_id: str | None, asknews_secret: str | None) -> str:
+    """
+    Pick the researcher: AskNews's news-summaries endpoint when both AskNews
+    env vars are configured, else the pinned OpenRouter fallback model.
+    Pure/no-network so it's directly unit-testable (tests/test_config.py).
+    """
+    if asknews_client_id and asknews_secret:
+        return "asknews/news-summaries"
+    return "openrouter/moonshotai/kimi-k3"
+
+
+def format_bot_cost_line(
+    question_id: int | str | None,
+    url: str | None,
+    usd: float,
+    researcher: str,
+    default_model: str,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> str:
+    """
+    One grep-able line per question: `event=bot_cost ...`. If litellm/
+    MonetaryCostManager couldn't price the call (usd rounds to 0), the
+    token-count fallback fields are appended so cost is still visible in
+    the logs (gate G0 stop condition).
+    """
+    line = (
+        f"event=bot_cost question_id={question_id} url={url} "
+        f"usd={usd:.4f} researcher={researcher} default={default_model}"
+    )
+    if usd <= 0.0 and input_tokens is not None and output_tokens is not None:
+        line += f" input_tokens={input_tokens} output_tokens={output_tokens}"
+    return line
+
+
+def format_bot_cost_total_line(questions: int, total_usd: float) -> str:
+    """Run-total companion line to format_bot_cost_line, logged once at exit."""
+    mean_usd = total_usd / questions if questions else 0.0
+    return f"event=bot_cost_total questions={questions} usd={total_usd:.4f} mean_usd={mean_usd:.4f}"
+
+
+class _TokenUsageTracker:
+    """
+    Per-question fallback token counter, populated only to cover the case
+    where MonetaryCostManager can't price a model (usd stays 0 -- e.g. a
+    model litellm has no cost entry for). Scoped per-asyncio-task via a
+    ContextVar, the same isolation trick forecasting_tools' own
+    HardLimitManager/MonetaryCostManager uses: forecast_questions() runs
+    every question concurrently via asyncio.gather, and each gathered
+    coroutine gets its own copy of the context, so concurrent questions
+    never share (or race on) a counter -- no locking or sleep needed.
+    """
+
+    _active: ContextVar[list["_TokenUsageTracker"]] = ContextVar(
+        "_active_token_trackers", default=[]
+    )
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def __enter__(self) -> "_TokenUsageTracker":
+        trackers = self._active.get().copy()
+        trackers.append(self)
+        self._active.set(trackers)
+        _TokenUsageCallback.initialize()
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb) -> None:
+        trackers = self._active.get().copy()
+        trackers.remove(self)
+        self._active.set(trackers)
+
+    @classmethod
+    def _record(cls, prompt_tokens: int, completion_tokens: int) -> None:
+        for tracker in cls._active.get():
+            tracker.input_tokens += prompt_tokens
+            tracker.output_tokens += completion_tokens
+
+
+class _TokenUsageCallback(LitellmCustomLogger):
+    """litellm success-callback companion to _TokenUsageTracker."""
+
+    _initialized = False
+
+    @staticmethod
+    def initialize() -> None:
+        if _TokenUsageCallback._initialized:
+            return
+        already_registered = any(
+            isinstance(handler, _TokenUsageCallback) for handler in litellm.callbacks
+        )
+        if not already_registered:
+            litellm.callbacks.append(_TokenUsageCallback())
+        _TokenUsageCallback._initialized = True
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):  # NOSONAR
+        self._track(response_obj)
+
+    async def async_log_success_event(
+        self, kwargs, response_obj, start_time, end_time
+    ):  # NOSONAR
+        self._track(response_obj)
+
+    @staticmethod
+    def _track(response_obj) -> None:
+        usage = getattr(response_obj, "usage", None)
+        if usage is None:
+            return
+        _TokenUsageTracker._record(
+            getattr(usage, "prompt_tokens", 0) or 0,
+            getattr(usage, "completion_tokens", 0) or 0,
+        )
+
+
+class FableForecastBot(ForecastBot):
     """
     This is the template bot for Summer 2026 Metaculus AI Tournament.
     This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
@@ -128,6 +247,46 @@ class SummerTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._question_costs_usd: list[float] = []
+
+    ##################################### COST LOGGING #####################################
+
+    async def _run_individual_question(self, question: MetaculusQuestion):
+        # forecasting_tools' own ForecastBot._run_individual_question already
+        # wraps each question's research+forecast in `MonetaryCostManager` and
+        # records the total on the returned report as `price_estimate` -- so
+        # rather than nesting a second MonetaryCostManager here (which would
+        # just re-total the same litellm callbacks), this reuses that value.
+        # The per-question token counter below only backstops the case where
+        # litellm has no price for a pinned model and price_estimate is 0.
+        with _TokenUsageTracker() as tokens:
+            report = await super()._run_individual_question(question)
+        usd = report.price_estimate or 0.0
+        self._question_costs_usd.append(usd)
+        question_id = question.id_of_question or question.id_of_post
+        researcher_name = self.get_llm("researcher", "string_name")
+        # get_llm(..., "string_name") logs a warning when the llm is a
+        # GeneralLlm (it is, for "default" -- see the llms= block below);
+        # read .model directly to avoid a warning on every single question.
+        default_llm = self.get_llm("default")
+        default_name = (
+            default_llm.model if isinstance(default_llm, GeneralLlm) else default_llm
+        )
+        logger.info(
+            format_bot_cost_line(
+                question_id=question_id,
+                url=question.page_url,
+                usd=usd,
+                researcher=researcher_name,
+                default_model=default_name,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+            )
+        )
+        return report
 
     ##################################### RESEARCH #####################################
 
@@ -667,10 +826,22 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = SummerTemplateBot2026(
+    # Gate G0 (<=US$0.40/question) is measured from the per-question and
+    # run-total `event=bot_cost*` log lines emitted by
+    # FableForecastBot._run_individual_question below.
+    print(
+        f"Tournament ids: CURRENT_AI_COMPETITION_ID={MetaculusClient.CURRENT_AI_COMPETITION_ID} "
+        f"CURRENT_MINIBENCH_ID={MetaculusClient.CURRENT_MINIBENCH_ID}"
+    )
+
+    # Pinned, cheap-by-design OpenRouter models (project-backlog#599): Sonnet
+    # 5 as judge/default, Haiku 4.5 for parsing/summarizing, and AskNews for
+    # research when both its env vars are configured, else Kimi K3 as the
+    # cheap fallback researcher.
+    researcher_model = select_researcher(
+        os.getenv("ASKNEWS_CLIENT_ID"), os.getenv("ASKNEWS_SECRET")
+    )
+    template_bot = FableForecastBot(
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
@@ -678,24 +849,24 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="openrouter/anthropic/claude-sonnet-5",
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            ),
+            "summarizer": "openrouter/anthropic/claude-haiku-4.5",
+            "researcher": researcher_model,
+            "parser": "openrouter/anthropic/claude-haiku-4.5",
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
     # whenever those rotate seasons.
     TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/summer-futureeval-2026/",
+        "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
@@ -737,6 +908,12 @@ if __name__ == "__main__":
             )
         )
 
+    logger.info(
+        format_bot_cost_total_line(
+            questions=len(template_bot._question_costs_usd),
+            total_usd=sum(template_bot._question_costs_usd),
+        )
+    )
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
         forecast_reports,
