@@ -55,6 +55,18 @@ def silence_noisy_dependencies() -> None:
     litellm_logger.propagate = False
 
 
+def has_llm_key() -> bool:
+    """
+    True if at least one LLM key is configured (OpenRouter, OpenAI, or
+    Anthropic). Pure/no-network -- used both by check_environment's warning
+    and by main.py's keyless tournament-mode skip (project-backlog#618).
+    """
+    return any(
+        _is_real_env(k)
+        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+    )
+
+
 def check_environment(strict: bool = True) -> None:
     """
     Verify METACULUS_TOKEN is set; warn if no LLM key is configured. On
@@ -68,11 +80,7 @@ def check_environment(strict: bool = True) -> None:
             "Get one at https://www.metaculus.com/futureeval/participate/"
         )
 
-    has_llm_key = any(
-        _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
-    )
-    if not has_llm_key:
+    if not has_llm_key():
         print(
             "⚠️  No LLM key set (OPENROUTER/OPENAI/ANTHROPIC). The bot will fall back\n"
             "    to the Metaculus LLM proxy. Free OpenRouter credits: "
