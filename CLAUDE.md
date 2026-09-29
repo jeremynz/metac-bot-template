@@ -69,6 +69,26 @@ counter, isolated per question the same way `MonetaryCostManager`/
 task with its own copy of the context, so concurrent questions never share
 a counter).
 
+## Spend guard (gate G0)
+
+`METAC_MAX_USD_PER_RUN` (default 3.0) and `METAC_MAX_USD_PER_QUESTION`
+(default 0.60), both in `.env.template`. In `__main__`, one
+`MonetaryCostManager(hard_limit=METAC_MAX_USD_PER_RUN)` wraps a run; in
+tournament mode (two sequential `forecast_on_tournament` calls -- seasonal,
+then MiniBench) the second call is skipped if the first already exhausted
+the budget, logging `event=bot_budget_exhausted spent=<x> limit=<y>`.
+`forecasting_tools`'s `forecast_questions()` dispatches all of ONE
+tournament's questions via a single `asyncio.gather` with no incremental
+interruption hook, so this guard's granularity is between the two
+`forecast_on_tournament` calls, not mid-batch within either one. Per-question
+overrun of `METAC_MAX_USD_PER_QUESTION` is warning-only
+(`event=bot_cost_over_question_cap`) -- a question already dispatched is
+never skipped for going over (wave7 policy 8).
+
+Tournament mode with no LLM key configured exits 0 with one line
+(`event=bot_skip reason=no_llm_key`) instead of proceeding to error on every
+question -- see `has_llm_key()` in `bot_helpers.py`.
+
 ## Testing and tooling
 
 - Repo declares deps via Poetry (`pyproject.toml` + `poetry.lock`); install

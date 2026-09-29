@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Literal
@@ -13,6 +14,7 @@ from litellm.integrations.custom_logger import CustomLogger as LitellmCustomLogg
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
+    has_llm_key,
     print_run_summary_banner,
     print_startup_banner,
     silence_noisy_dependencies,
@@ -35,6 +37,7 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
+    MonetaryCostManager,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
@@ -96,6 +99,84 @@ def format_bot_cost_total_line(questions: int, total_usd: float) -> str:
     """Run-total companion line to format_bot_cost_line, logged once at exit."""
     mean_usd = total_usd / questions if questions else 0.0
     return f"event=bot_cost_total questions={questions} usd={total_usd:.4f} mean_usd={mean_usd:.4f}"
+
+
+def get_max_usd_per_run() -> float:
+    """
+    METAC_MAX_USD_PER_RUN env var (default 3.0) -- gate G0 hard cap on total
+    spend for one process run (project-backlog#618). Read live (not cached
+    at import time) so tests can monkeypatch the env var directly.
+    """
+    return float(os.getenv("METAC_MAX_USD_PER_RUN", "3.0"))
+
+
+def get_max_usd_per_question() -> float:
+    """
+    METAC_MAX_USD_PER_QUESTION env var (default 0.60) -- gate G0 per-question
+    warning threshold (project-backlog#618). Warning only: per wave7 policy
+    8, a question is never skipped for score reasons once it's dispatched.
+    """
+    return float(os.getenv("METAC_MAX_USD_PER_QUESTION", "0.60"))
+
+
+def format_bot_budget_exhausted_line(spent: float, limit: float) -> str:
+    """Logged when the run-level MonetaryCostManager hard limit is hit."""
+    return f"event=bot_budget_exhausted spent={spent:.4f} limit={limit:.2f}"
+
+
+def format_bot_cost_over_question_cap_line(
+    question_id: int | str | None, usd: float, cap: float
+) -> str:
+    """Warning-only companion to format_bot_cost_line: one question's cost
+    exceeded METAC_MAX_USD_PER_QUESTION. Never causes the question to be
+    skipped (wave7 policy 8) -- logged after the fact."""
+    return (
+        f"event=bot_cost_over_question_cap question_id={question_id} "
+        f"usd={usd:.4f} cap={cap:.2f}"
+    )
+
+
+def run_tournament_mode(
+    template_bot: "FableForecastBot",
+    client: MetaculusClient,
+    run_cost_manager: MonetaryCostManager,
+) -> list:
+    """
+    Tournament-mode dispatch: two sequential forecast_on_tournament calls
+    (seasonal AI competition, then MiniBench).
+
+    Gate G0 spend guard (project-backlog#618): if the first call already
+    exhausted run_cost_manager's hard_limit, the second is skipped entirely
+    (logged as event=bot_budget_exhausted) rather than dispatched.
+    forecasting_tools' own forecast_questions() dispatches every question of
+    ONE tournament in a single asyncio.gather with no incremental
+    interruption hook it exposes, so this guard's granularity is between
+    the two forecast_on_tournament calls, not mid-batch within either one.
+
+    Extracted from __main__ (not just inline) so it's callable directly from
+    tests/test_budget.py without spawning a subprocess or exercising the
+    argparse/check_environment scaffolding above it.
+    """
+    seasonal_tournament_reports = asyncio.run(
+        template_bot.forecast_on_tournament(
+            client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        )
+    )
+    if run_cost_manager.hard_limit and run_cost_manager.amount_left <= 0:
+        logger.warning(
+            format_bot_budget_exhausted_line(
+                spent=run_cost_manager.current_usage,
+                limit=run_cost_manager.hard_limit,
+            )
+        )
+        minibench_reports = []
+    else:
+        minibench_reports = asyncio.run(
+            template_bot.forecast_on_tournament(
+                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            )
+        )
+    return seasonal_tournament_reports + minibench_reports
 
 
 def format_parse_path_line(
@@ -306,6 +387,16 @@ class FableForecastBot(ForecastBot):
                 output_tokens=tokens.output_tokens,
             )
         )
+        question_max_usd = get_max_usd_per_question()
+        if question_max_usd and usd > question_max_usd:
+            # Warning only (wave7 policy 8): the question already ran and is
+            # never skipped for score reasons -- this just flags gate G0
+            # overruns after the fact.
+            logger.warning(
+                format_bot_cost_over_question_cap_line(
+                    question_id=question_id, usd=usd, cap=question_max_usd
+                )
+            )
         return report
 
     ##################################### RESEARCH #####################################
@@ -894,6 +985,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
+    # Clean keyless skip (project-backlog#618): the cron
+    # (run_bot_on_tournament.yaml) fires every 20 minutes in tournament mode.
+    # Before an LLM key secret is configured, check_environment(strict=True)
+    # below only warns (METACULUS_TOKEN is the only hard requirement there),
+    # so the run would otherwise proceed and error on every single question.
+    # Exit 0 with one grep-able line instead.
+    if run_mode == "tournament" and not has_llm_key():
+        print("event=bot_skip reason=no_llm_key")
+        sys.exit(0)
+
     check_environment(strict=True)
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
@@ -946,39 +1047,55 @@ if __name__ == "__main__":
     # Dispatch on mode. Each branch produces a list of ForecastReport (or
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
+    #
+    # Gate G0 spend guard (project-backlog#618): one MonetaryCostManager
+    # wraps the whole run. In tournament mode there are two sequential
+    # asyncio.run() calls (seasonal, then MiniBench) -- if the first already
+    # exhausted the run budget, the second is skipped entirely rather than
+    # dispatched. forecasting_tools' own forecast_questions() dispatches all
+    # of ONE tournament's questions in a single asyncio.gather with no
+    # incremental interruption hook, so this guard's granularity is between
+    # the two forecast_on_tournament calls, not mid-batch within one -- see
+    # PR body for the full receipt.
     client = MetaculusClient()
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+    max_usd_per_run = get_max_usd_per_run()
+    with MonetaryCostManager(hard_limit=max_usd_per_run) as run_cost_manager:
+        if run_mode == "tournament":
+            forecast_reports = run_tournament_mode(template_bot, client, run_cost_manager)
+        elif run_mode == "metaculus_cup":
+            # The Metaculus Cup may be uninitialized near the start of a season
+            # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
+            # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
+            template_bot.skip_previously_forecasted_questions = False
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+                )
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            if run_cost_manager.hard_limit and run_cost_manager.amount_left <= 0:
+                logger.warning(
+                    format_bot_budget_exhausted_line(
+                        spent=run_cost_manager.current_usage,
+                        limit=run_cost_manager.hard_limit,
+                    )
+                )
+        elif run_mode == "test_questions":
+            # The bot-testing-area tournament contains all question types and is
+            # the recommended target for smoke-testing your bot.
+            # https://www.metaculus.com/tournament/bot-testing-area/
+            template_bot.skip_previously_forecasted_questions = False
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    "bot-testing-area", return_exceptions=True
+                )
             )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
-        # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
-        )
+            if run_cost_manager.hard_limit and run_cost_manager.amount_left <= 0:
+                logger.warning(
+                    format_bot_budget_exhausted_line(
+                        spent=run_cost_manager.current_usage,
+                        limit=run_cost_manager.hard_limit,
+                    )
+                )
 
     logger.info(
         format_bot_cost_total_line(
