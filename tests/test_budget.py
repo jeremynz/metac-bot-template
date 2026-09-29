@@ -21,6 +21,9 @@ import sys
 from unittest import mock
 
 from forecasting_tools import ForecastBot, GeneralLlm, MonetaryCostManager
+from forecasting_tools.ai_models.resource_managers.hard_limit_manager import (
+    HardLimitExceededError,
+)
 from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
     HardLimitManager,
 )
@@ -47,6 +50,20 @@ class _StubQuestion:
 class _StubReport:
     def __init__(self, price_estimate: float) -> None:
         self.price_estimate = price_estimate
+
+
+class _StubResearchQuestion:
+    """Enough of a MetaculusQuestion for run_research's prompt formatting
+    and _run_individual_question's question_id lookup -- not a real
+    MetaculusQuestion (avoids any network/Pydantic-model setup)."""
+
+    def __init__(self, qid: int) -> None:
+        self.id_of_question = qid
+        self.id_of_post = None
+        self.page_url = f"https://www.metaculus.com/questions/{qid}/"
+        self.question_text = "Will X happen?"
+        self.resolution_criteria = "Resolves YES if X happens."
+        self.fine_print = ""
 
 
 def _minimal_bot() -> FableForecastBot:
@@ -230,6 +247,137 @@ def test_tournament_mode_no_hard_limit_never_skips():
         _FakeClient.CURRENT_AI_COMPETITION_ID,
         _FakeClient.CURRENT_MINIBENCH_ID,
     ]
+
+
+# ---- per-question stop: _run_individual_question guard ---------------------
+
+
+def test_run_individual_question_does_not_dispatch_when_run_budget_exhausted(caplog):
+    """Reviewer-requested per-question test (PR #7 round 1): parent mocked,
+    run manager already exhausted, assert the parent is never called."""
+    bot = _minimal_bot()
+    parent_calls: list[object] = []
+
+    async def fake_parent_run_individual_question(self, question):
+        parent_calls.append(question)
+        return _StubReport(price_estimate=0.0)
+
+    with mock.patch.object(
+        ForecastBot, "_run_individual_question", fake_parent_run_individual_question
+    ):
+        with caplog.at_level(logging.WARNING, logger="main"):
+            with MonetaryCostManager(hard_limit=1.0):
+                HardLimitManager.increase_current_usage_in_parent_managers(1.0)
+                try:
+                    asyncio.run(bot._run_individual_question(_StubResearchQuestion(1)))
+                    raised = False
+                except HardLimitExceededError:
+                    raised = True
+
+    assert raised is True
+    assert parent_calls == []  # parent never called
+    [logged_line] = [
+        r.message for r in caplog.records if "event=bot_budget_exhausted" in r.message
+    ]
+    assert "spent=1.0000 limit=1.00" in logged_line
+
+
+def test_run_individual_question_dispatches_when_run_budget_not_exhausted():
+    bot = _minimal_bot()
+    parent_calls: list[object] = []
+
+    async def fake_parent_run_individual_question(self, question):
+        parent_calls.append(question)
+        return _StubReport(price_estimate=0.1)
+
+    with mock.patch.object(
+        ForecastBot, "_run_individual_question", fake_parent_run_individual_question
+    ):
+        with MonetaryCostManager(hard_limit=1.0):
+            report = asyncio.run(
+                bot._run_individual_question(_StubResearchQuestion(1))
+            )
+
+    assert len(parent_calls) == 1
+    assert report.price_estimate == 0.1
+
+
+# ---- per-question stop: the real serialization point (run_research) -------
+
+
+def test_run_research_stops_question_after_run_budget_exhausted_mid_batch(monkeypatch):
+    """
+    This is the test the deliverable actually needs: "budget exhausted
+    after N questions and question N+1 isn't run" -- demonstrated against
+    real concurrent dispatch, the way forecast_questions() itself dispatches
+    a tournament's questions (one asyncio.gather over all of them), not a
+    sequential red/green pair of direct calls.
+
+    A check placed only at the top of _run_individual_question, before any
+    await (see the test above), does NOT stop question N+1 within a single
+    batch like this: asyncio.gather() schedules all N question-tasks up
+    front, and each one's synchronous prefix -- everything up to its own
+    first real suspension -- runs before question 1's research call
+    returns and updates current_usage, so all N would read the same
+    pre-exhaustion budget (reproduced independently against a bare
+    asyncio.Semaphore(1) while diagnosing this review round: all 5 tasks in
+    a 5-task batch observed usage=0 at their pre-check, even though the
+    first task's completion alone exceeded the cap).
+
+    run_research's `_concurrency_limiter` (`_max_concurrent_questions = 1`)
+    is the one place questions are actually serialized -- the next
+    question only enters after the previous one's research call has
+    returned -- so a check made right after acquiring it does see an
+    up-to-date budget and does stop question N+1. This test dispatches 3
+    questions concurrently via asyncio.gather (matching forecast_questions'
+    own dispatch); a fake researcher call increases usage by $0.60 and
+    yields via a real asyncio.sleep (simulating network latency) before
+    returning, so later questions' turn at the semaphore only comes after
+    that cost has landed.
+    """
+    monkeypatch.setenv("METAC_MAX_USD_PER_RUN", "1.0")
+    # A GeneralLlm researcher (rather than _minimal_bot()'s asknews one) --
+    # AskNewsSearcher() itself raises ValueError in this sandbox with no
+    # ASKNEWS_* credentials configured, before ever reaching run_research's
+    # cost-incurring call, which would falsely read as "stopped by the
+    # budget guard". GeneralLlm.invoke needs no credentials to construct.
+    bot = FableForecastBot(
+        llms={
+            "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-5"),
+            "summarizer": "openrouter/anthropic/claude-haiku-4.5",
+            "researcher": GeneralLlm(model="openrouter/moonshotai/kimi-k3"),
+            "parser": "openrouter/anthropic/claude-haiku-4.5",
+        },
+    )
+    researcher_calls: list[int] = []
+
+    async def fake_invoke(self, prompt, **kwargs):
+        researcher_calls.append(1)
+        await asyncio.sleep(0.01)
+        HardLimitManager.increase_current_usage_in_parent_managers(0.6)
+        return "research"
+
+    monkeypatch.setattr(GeneralLlm, "invoke", fake_invoke)
+
+    questions = [_StubResearchQuestion(i) for i in range(3)]
+
+    async def run_all():
+        with MonetaryCostManager(hard_limit=get_max_usd_per_run()):
+            return await asyncio.gather(
+                *[bot.run_research(q) for q in questions], return_exceptions=True
+            )
+
+    results = asyncio.run(run_all())
+
+    # The check is `amount_left <= 0`, evaluated *before* that question's
+    # own spend: question 1 passes at $0/$1.0, spends to $0.60 (still
+    # $0.40 left, not yet exhausted); question 2 passes at $0.60/$1.0,
+    # spends to $1.20 (now exhausted); question 3's check then sees
+    # amount_left <= 0 and is stopped before ever calling the researcher.
+    assert len(researcher_calls) == 2
+    assert results[0] == "research"
+    assert results[1] == "research"
+    assert isinstance(results[2], HardLimitExceededError)
 
 
 # ---- has_llm_key --------------------------------------------------------

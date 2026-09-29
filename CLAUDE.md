@@ -73,17 +73,30 @@ a counter).
 
 `METAC_MAX_USD_PER_RUN` (default 3.0) and `METAC_MAX_USD_PER_QUESTION`
 (default 0.60), both in `.env.template`. In `__main__`, one
-`MonetaryCostManager(hard_limit=METAC_MAX_USD_PER_RUN)` wraps a run; in
-tournament mode (two sequential `forecast_on_tournament` calls -- seasonal,
-then MiniBench) the second call is skipped if the first already exhausted
-the budget, logging `event=bot_budget_exhausted spent=<x> limit=<y>`.
+`MonetaryCostManager(hard_limit=METAC_MAX_USD_PER_RUN)` wraps a run.
 `forecasting_tools`'s `forecast_questions()` dispatches all of ONE
-tournament's questions via a single `asyncio.gather` with no incremental
-interruption hook, so this guard's granularity is between the two
-`forecast_on_tournament` calls, not mid-batch within either one. Per-question
-overrun of `METAC_MAX_USD_PER_QUESTION` is warning-only
+tournament's questions via a single `asyncio.gather`, but
+`FableForecastBot.run_research` checks the same run budget right after
+acquiring `_concurrency_limiter` (`_max_concurrent_questions = 1`, the one
+point questions are actually serialized -- the next question only enters
+after the previous one's research call, its main cost, has returned and
+updated `current_usage`), logging `event=bot_budget_exhausted spent=<x>
+limit=<y>` and raising instead of dispatching. This stops question N+1
+mid-batch, in-repo, no `forecasting_tools` fork needed -- see
+`_active_run_budget_exhausted`'s docstring in `main.py` for why a check
+placed only at the top of `_run_individual_question`, before any `await`,
+would not be enough (all of a batch's question-tasks pass it before any one
+of them finishes and updates the budget). `_run_individual_question` also
+checks it, both because that's correct too (catches the budget already
+exhausted before this wave of dispatch starts, e.g. between the seasonal and
+MiniBench `forecast_on_tournament` calls -- `run_tournament_mode`'s
+inter-tournament check is a coarse belt on top of the same thing) and to
+fail fast before any non-serialized per-question setup work runs.
+Per-question overrun of `METAC_MAX_USD_PER_QUESTION` is warning-only
 (`event=bot_cost_over_question_cap`) -- a question already dispatched is
-never skipped for going over (wave7 policy 8).
+never skipped for going over (wave7 policy 8); that stays true here too --
+this guard only ever stops dispatch of a question *before* it starts,
+never a question already in flight.
 
 Tournament mode with no LLM key configured exits 0 with one line
 (`event=bot_skip reason=no_llm_key`) instead of proceeding to error on every
