@@ -12,6 +12,10 @@ on:
           - tournament
           - test_questions
         default: tournament
+      max_questions:
+        description: "Max questions to forecast (0 = unlimited)"
+        type: string
+        default: "0"
   schedule:
     - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
 
@@ -24,6 +28,7 @@ concurrency:
 # Daily job to run the simple forecast bot
 jobs:
   forecast_job:
+    timeout-minutes: 30
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
@@ -52,7 +57,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py --mode ${{ inputs.mode || 'tournament' }}
+          poetry run python main.py --mode ${{ inputs.mode || 'tournament' }} --max-questions ${{ inputs.max_questions || '0' }}
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
