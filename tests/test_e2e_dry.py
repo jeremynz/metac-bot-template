@@ -213,3 +213,39 @@ def test_red_non_monotone_percentiles_never_post_invalid():
     _run(_bot(client, bad, parser_text="not json"), _numeric())
     assert client.forecasts == []
     assert client.comments == []
+
+
+# ---- bot_latency: emitted only when a forecast was submitted (#690) ---------
+
+
+def _latency_lines(caplog):
+    return [r.getMessage() for r in caplog.records if "event=bot_latency" in r.getMessage()]
+
+
+def test_bot_latency_once_for_published_question(caplog):
+    caplog.set_level(logging.INFO)
+    client = StubClient()
+    _run(_bot(client, "Rationale.\nProbability: 62%"), _binary())
+    assert len(client.forecasts) == 1
+    lines = _latency_lines(caplog)
+    assert len(lines) == 1 and "question_id=101" in lines[0]
+
+
+def test_bot_latency_not_emitted_for_failed_question(caplog):
+    caplog.set_level(logging.INFO)
+    bad = NUMERIC_TEXT.replace("Percentile 40: 35", "Percentile 40: 5")
+    client = StubClient()
+    _run(_bot(client, bad, parser_text="not json"), _numeric())
+    assert client.forecasts == []
+    assert _latency_lines(caplog) == []
+
+
+def test_bot_latency_not_emitted_when_publish_fails(caplog):
+    caplog.set_level(logging.INFO)
+
+    class FailingClient(StubClient):
+        def post_binary_question_prediction(self, question_id, prediction_in_decimal):
+            raise RuntimeError("POST failed")
+
+    _run(_bot(FailingClient(), "Rationale.\nProbability: 62%"), _binary())
+    assert _latency_lines(caplog) == []
