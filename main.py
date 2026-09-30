@@ -111,6 +111,75 @@ def format_bot_cost_total_line(questions: int, total_usd: float) -> str:
     return f"event=bot_cost_total questions={questions} usd={total_usd:.4f} mean_usd={mean_usd:.4f}"
 
 
+# OpenRouter list prices per token (project-backlog#676). litellm 1.80.10
+# doesn't map haiku-4.5 under the openrouter/ prefix, so its cost is 0 unless
+# registered; ensure_model_pricing() registers only the slugs that price at 0.
+PINNED_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "openrouter/anthropic/claude-sonnet-5": (2e-6, 1e-5),
+    "openrouter/anthropic/claude-haiku-4.5": (1e-6, 5e-6),
+    "openrouter/moonshotai/kimi-k3": (3e-6, 1.5e-5),
+}
+
+
+def mock_cost_usd(model: str) -> float:
+    """USD MonetaryCostManager records for one mocked call to `model`."""
+    with MonetaryCostManager() as cm:
+        asyncio.run(
+            GeneralLlm(model=model, mock_response="hello " * 2000).invoke(
+                "word " * 3000
+            )
+        )
+    return cm.current_usage
+
+
+def ensure_model_pricing() -> list[str]:
+    """Register list prices for pinned models litellm prices at 0.
+
+    Returns the slugs registered.
+    """
+    registered = []
+    for model, (inp, out) in PINNED_MODEL_PRICES.items():
+        if mock_cost_usd(model) > 0:
+            continue
+        litellm.register_model(
+            {
+                model: {
+                    "input_cost_per_token": inp,
+                    "output_cost_per_token": out,
+                    "litellm_provider": "openrouter",
+                    "mode": "chat",
+                }
+            }
+        )
+        logger.warning(f"event=bot_price_registered model={model}")
+        registered.append(model)
+    return registered
+
+
+def _is_budget_stop(report: object) -> bool:
+    err = report if isinstance(report, BaseException) else None
+    while err is not None:
+        if isinstance(err, HardLimitExceededError):
+            return True
+        err = err.__cause__ or err.__context__
+    return False
+
+
+def split_budget_stops(reports: list) -> tuple[list, list]:
+    """(reports without budget stops, budget-stop exceptions)."""
+    kept = [r for r in reports if not _is_budget_stop(r)]
+    return kept, [r for r in reports if _is_budget_stop(r)]
+
+
+def format_bot_run_spend_line(
+    usd: float, limit: float, questions_ok: int, questions_failed: int
+) -> str:
+    return (
+        f"event=bot_run_spend usd={usd:.4f} limit={limit} "
+        f"questions_ok={questions_ok} questions_failed={questions_failed}"
+    )
+
+
 def get_max_usd_per_run() -> float:
     """
     METAC_MAX_USD_PER_RUN env var (default 3.0) -- gate G0 hard cap on total
@@ -1151,6 +1220,7 @@ if __name__ == "__main__":
     researcher_model = select_researcher(
         os.getenv("ASKNEWS_CLIENT_ID"), os.getenv("ASKNEWS_SECRET")
     )
+    ensure_model_pricing()
     template_bot = FableForecastBot(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -1242,7 +1312,22 @@ if __name__ == "__main__":
             total_usd=sum(template_bot._question_costs_usd),
         )
     )
-    template_bot.log_report_summary(forecast_reports)
+    real_reports, budget_stops = split_budget_stops(forecast_reports)
+    for stop in budget_stops:
+        logger.warning(f"event=bot_budget_exhausted error={stop}")
+    questions_failed = sum(isinstance(r, BaseException) for r in real_reports)
+    spend_line = format_bot_run_spend_line(
+        usd=run_cost_manager.current_usage,
+        limit=max_usd_per_run,
+        questions_ok=len(real_reports) - questions_failed,
+        questions_failed=questions_failed,
+    )
+    logger.info(spend_line)
+    _summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if _summary_path:
+        with open(_summary_path, "a") as _f:
+            _f.write(spend_line + "\n")
+    template_bot.log_report_summary(real_reports)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
