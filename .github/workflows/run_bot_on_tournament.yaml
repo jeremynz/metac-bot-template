@@ -57,10 +57,11 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py --mode ${{ inputs.mode || 'tournament' }} --max-questions ${{ inputs.max_questions || '0' }}
+          poetry run python main.py --mode ${{ inputs.mode || 'tournament' }} --max-questions "$MAX_QUESTIONS"
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
+          MAX_QUESTIONS: ${{ inputs.max_questions || '0' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}

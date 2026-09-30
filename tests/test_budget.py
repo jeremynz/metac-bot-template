@@ -453,3 +453,40 @@ def test_max_questions_caps_dispatch_in_input_order(caplog):
 
 def test_max_questions_zero_is_unlimited():
     assert _run_capped(5, 0) == [0, 1, 2, 3, 4]
+
+
+# ---- soonest-first / closing-soon / cap order (project-backlog#677, #684) ---
+
+
+def _dispatch(closes, max_questions=0, forecasted=()):
+    from datetime import datetime, timedelta, timezone
+
+    bot = _minimal_bot()
+    bot._max_questions = max_questions
+    bot.skip_previously_forecasted_questions = True
+    seen: list[int] = []
+
+    async def fake_run(question):
+        seen.append(question.id_of_question)
+        return None
+
+    bot._run_individual_question_with_error_propagation = fake_run
+    now = datetime.now(timezone.utc)
+    questions = []
+    for i, m in enumerate(closes):
+        q = _StubResearchQuestion(i)
+        q.close_time = None if m is None else now + timedelta(minutes=m)
+        q.already_forecasted = i in forecasted
+        questions.append(q)
+    asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+    return seen
+
+
+def test_soonest_first_and_closing_soon_skipped(caplog):
+    with caplog.at_level(logging.INFO):
+        assert _dispatch([90, 30, 5, None]) == [1, 0, 3]
+    assert "event=bot_question_skip reason=closing_soon question_id=2" in caplog.text
+
+
+def test_cap_applies_after_dropping_already_forecasted():
+    assert _dispatch([None] * 4, max_questions=2, forecasted=(0, 1)) == [2, 3]
