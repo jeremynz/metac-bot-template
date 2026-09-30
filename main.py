@@ -595,6 +595,9 @@ class FableForecastBot(ForecastBot):
         self._question_costs_usd.append(usd)
         question_id = question.id_of_question or question.id_of_post
         minutes_left = _minutes_to_close(question)
+        # Reached only if super() returned, i.e. the forecast was published
+        # (or publishing is disabled and the report was built); any failure,
+        # skip or budget stop raises above and never emits (project-backlog#690).
         logger.info(
             f"event=bot_latency question_id={question_id} "
             f"minutes_to_close={'none' if minutes_left is None else f'{minutes_left:.1f}'}"
