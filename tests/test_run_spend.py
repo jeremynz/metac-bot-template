@@ -46,6 +46,7 @@ def test_only_budget_stops_leaves_nothing_for_log_report_summary():
 
 
 def test_spend_line_format():
-    assert main.format_bot_run_spend_line(1.23456, 3.0, 4, 1) == (
-        "event=bot_run_spend usd=1.2346 limit=3.0 questions_ok=4 questions_failed=1"
+    assert main.format_bot_run_spend_line(1.23456, 3.0, 4, 1, 2) == (
+        "event=bot_run_spend usd=1.2346 limit=3.0 questions_ok=4 "
+        "questions_failed=1 questions_budget_stopped=2"
     )

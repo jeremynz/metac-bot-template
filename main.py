@@ -141,16 +141,20 @@ def ensure_model_pricing() -> list[str]:
     for model, (inp, out) in PINNED_MODEL_PRICES.items():
         if mock_cost_usd(model) > 0:
             continue
-        litellm.register_model(
-            {
-                model: {
-                    "input_cost_per_token": inp,
-                    "output_cost_per_token": out,
-                    "litellm_provider": "openrouter",
-                    "mode": "chat",
-                }
-            }
-        )
+        entry = {
+            "input_cost_per_token": inp,
+            "output_cost_per_token": out,
+            "litellm_provider": "openrouter",
+            "mode": "chat",
+        }
+        prices = {model: entry}
+        # litellm 1.80.10 resolves openrouter/anthropic/* responses to the
+        # anthropic cost calculator with the bare model name, so the price must
+        # also sit under that key with provider "anthropic".
+        if model.startswith("openrouter/anthropic/"):
+            bare = model.removeprefix("openrouter/anthropic/")
+            prices[bare] = {**entry, "litellm_provider": "anthropic"}
+        litellm.register_model(prices)
         logger.warning(f"event=bot_price_registered model={model}")
         registered.append(model)
     return registered
@@ -172,11 +176,16 @@ def split_budget_stops(reports: list) -> tuple[list, list]:
 
 
 def format_bot_run_spend_line(
-    usd: float, limit: float, questions_ok: int, questions_failed: int
+    usd: float,
+    limit: float,
+    questions_ok: int,
+    questions_failed: int,
+    questions_budget_stopped: int = 0,
 ) -> str:
     return (
         f"event=bot_run_spend usd={usd:.4f} limit={limit} "
-        f"questions_ok={questions_ok} questions_failed={questions_failed}"
+        f"questions_ok={questions_ok} questions_failed={questions_failed} "
+        f"questions_budget_stopped={questions_budget_stopped}"
     )
 
 
@@ -1316,11 +1325,13 @@ if __name__ == "__main__":
     for stop in budget_stops:
         logger.warning(f"event=bot_budget_exhausted error={stop}")
     questions_failed = sum(isinstance(r, BaseException) for r in real_reports)
+    questions_budget_stopped = len(budget_stops)
     spend_line = format_bot_run_spend_line(
         usd=run_cost_manager.current_usage,
         limit=max_usd_per_run,
         questions_ok=len(real_reports) - questions_failed,
         questions_failed=questions_failed,
+        questions_budget_stopped=questions_budget_stopped,
     )
     logger.info(spend_line)
     _summary_path = os.getenv("GITHUB_STEP_SUMMARY")
