@@ -198,6 +198,25 @@ def get_max_usd_per_run() -> float:
     return float(os.getenv("METAC_MAX_USD_PER_RUN", "3.0"))
 
 
+def get_min_minutes_to_close() -> float:
+    """METAC_MIN_MINUTES_TO_CLOSE env var (default 10): questions with less
+    time left are not dispatched (project-backlog#677)."""
+    return float(os.getenv("METAC_MIN_MINUTES_TO_CLOSE", "10") or "10")
+
+
+def _as_utc(dt):
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _minutes_to_close(question, now=None) -> float | None:
+    close = _as_utc(getattr(question, "close_time", None))
+    if close is None:
+        return None
+    return (close - (now or datetime.now(timezone.utc))).total_seconds() / 60
+
+
 def get_max_questions() -> int:
     """METAC_MAX_QUESTIONS env var (default 0 = unlimited): max questions
     forecast per forecast_questions() call (project-backlog#673)."""
@@ -500,16 +519,44 @@ class FableForecastBot(ForecastBot):
         )
 
     async def forecast_questions(self, questions, return_exceptions: bool = False):
-        """Keep only the first `max_questions` questions (input order) so a
-        first keyed smoke run is cheap. 0 = unlimited (default)."""
+        """Order of operations (project-backlog#677/#684): drop already-
+        forecasted, drop closing-soon, sort soonest-closing first (None
+        last), THEN cap at `max_questions` (0 = unlimited)."""
         questions = list(questions)
+        if self.skip_previously_forecasted_questions:
+            fresh = [q for q in questions if not q.already_forecasted]
+            if len(fresh) != len(questions):
+                logger.info(
+                    f"Skipping {len(questions) - len(fresh)} previously forecasted questions"
+                )
+            questions = fresh
+        min_minutes = get_min_minutes_to_close()
+        now = datetime.now(timezone.utc)
+        kept = []
+        for q in questions:
+            minutes = _minutes_to_close(q, now)
+            if minutes is not None and minutes < min_minutes:
+                logger.info(
+                    f"event=bot_question_skip reason=closing_soon "
+                    f"question_id={q.id_of_question or q.id_of_post} "
+                    f"minutes_to_close={minutes:.1f}"
+                )
+                continue
+            kept.append(q)
+        questions = sorted(
+            kept,
+            key=lambda q: (
+                getattr(q, "close_time", None) is None,
+                _as_utc(getattr(q, "close_time", None)) or now,
+            ),
+        )
         if self._max_questions > 0 and len(questions) > self._max_questions:
-            kept = questions[: self._max_questions]
+            capped = questions[: self._max_questions]
             logger.info(
-                f"event=bot_question_cap kept={len(kept)} "
-                f"dropped={len(questions) - len(kept)}"
+                f"event=bot_question_cap kept={len(capped)} "
+                f"dropped={len(questions) - len(capped)}"
             )
-            questions = kept
+            questions = capped
         return await super().forecast_questions(
             questions, return_exceptions=return_exceptions
         )
@@ -547,6 +594,11 @@ class FableForecastBot(ForecastBot):
         usd = report.price_estimate or 0.0
         self._question_costs_usd.append(usd)
         question_id = question.id_of_question or question.id_of_post
+        minutes_left = _minutes_to_close(question)
+        logger.info(
+            f"event=bot_latency question_id={question_id} "
+            f"minutes_to_close={'none' if minutes_left is None else f'{minutes_left:.1f}'}"
+        )
         researcher_name = self.get_llm("researcher", "string_name")
         # get_llm(..., "string_name") logs a warning when the llm is a
         # GeneralLlm (it is, for "default" -- see the llms= block below);
