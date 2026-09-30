@@ -3,6 +3,8 @@ This repository contains a simple bot meant to get you started with creating you
 
 **Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, paste two API keys into GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.
 
+See **[OPERATING.md](OPERATING.md)** for how to stop the bot, check spend, and read its logs.
+
 In this project are 2 files:
 - **main.py**: Our recommended template option that uses the [forecasting-tools](https://github.com/Metaculus/forecasting-tools) package to handle a lot of stuff in the background for you (such as API calls). We will update the package, thus allowing you to gain new features with minimal changes to your code.
 - **main_with_no_framework.py**: A copy of main.py but implemented with minimal dependencies. Useful if you want a more custom approach.
