@@ -49,7 +49,9 @@ class StubClient:
     def post_question_comment(
         self, post_id, comment_text, is_private=True, included_forecast=True
     ):
-        self.comments.append({"post_id": post_id, "text": comment_text})
+        self.comments.append(
+            {"post_id": post_id, "text": comment_text, "is_private": is_private}
+        )
 
 
 def _common(qid: int, post: int, text: str) -> dict:
@@ -145,6 +147,7 @@ def _assert_one_post(client, qid, post_id, caplog):
     assert client.forecasts[0][0] == qid
     assert len(client.comments) == 1
     assert client.comments[0]["post_id"] == post_id
+    assert client.comments[0]["is_private"] is True
     lines = _cost_lines(caplog)
     assert len(lines) == 1 and f"question_id={qid}" in lines[0]
 
