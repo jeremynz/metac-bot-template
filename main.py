@@ -118,6 +118,12 @@ def get_max_usd_per_run() -> float:
     return float(os.getenv("METAC_MAX_USD_PER_RUN", "3.0"))
 
 
+def get_max_questions() -> int:
+    """METAC_MAX_QUESTIONS env var (default 0 = unlimited): max questions
+    forecast per forecast_questions() call (project-backlog#673)."""
+    return max(0, int(os.getenv("METAC_MAX_QUESTIONS", "0") or "0"))
+
+
 def get_max_usd_per_question() -> float:
     """
     METAC_MAX_USD_PER_QUESTION env var (default 0.60) -- gate G0 per-question
@@ -405,9 +411,28 @@ class FableForecastBot(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, max_questions: int | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._question_costs_usd: list[float] = []
+        # 0 = unlimited (project-backlog#673).
+        self._max_questions = (
+            max_questions if max_questions is not None else get_max_questions()
+        )
+
+    async def forecast_questions(self, questions, return_exceptions: bool = False):
+        """Keep only the first `max_questions` questions (input order) so a
+        first keyed smoke run is cheap. 0 = unlimited (default)."""
+        questions = list(questions)
+        if self._max_questions > 0 and len(questions) > self._max_questions:
+            kept = questions[: self._max_questions]
+            logger.info(
+                f"event=bot_question_cap kept={len(kept)} "
+                f"dropped={len(questions) - len(kept)}"
+            )
+            questions = kept
+        return await super().forecast_questions(
+            questions, return_exceptions=return_exceptions
+        )
 
     ##################################### COST LOGGING #####################################
 
@@ -1077,6 +1102,13 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help="Forecast at most N questions (0 = unlimited; default: "
+        "METAC_MAX_QUESTIONS env, else unlimited)",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
@@ -1113,6 +1145,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
+        max_questions=args.max_questions,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,

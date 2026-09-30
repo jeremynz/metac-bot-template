@@ -423,3 +423,33 @@ def test_tournament_mode_with_no_llm_key_exits_zero_with_one_log_line():
     )
     assert result.returncode == 0
     assert "event=bot_skip reason=no_llm_key" in result.stdout
+
+
+# ---- question cap (project-backlog#673) -------------------------------------
+
+
+def _run_capped(n_questions: int, max_questions: int) -> list[int]:
+    bot = _minimal_bot()
+    bot._max_questions = max_questions
+    seen: list[int] = []
+
+    async def fake_run(question):
+        seen.append(question.id_of_question)
+        return None
+
+    bot._run_individual_question_with_error_propagation = fake_run
+    questions = [_StubResearchQuestion(i) for i in range(n_questions)]
+    for q in questions:
+        q.already_forecasted = False
+    asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+    return seen
+
+
+def test_max_questions_caps_dispatch_in_input_order(caplog):
+    with caplog.at_level(logging.INFO):
+        assert _run_capped(5, 2) == [0, 1]
+    assert "event=bot_question_cap kept=2 dropped=3" in caplog.text
+
+
+def test_max_questions_zero_is_unlimited():
+    assert _run_capped(5, 0) == [0, 1, 2, 3, 4]
