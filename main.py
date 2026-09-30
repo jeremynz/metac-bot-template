@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import atexit
 import logging
 import os
 import sys
@@ -9,6 +10,7 @@ from typing import Literal
 
 import dotenv
 import litellm
+import openrouter_guard
 from litellm.integrations.custom_logger import CustomLogger as LitellmCustomLogger
 
 # HardLimitExceededError/get_active_cost_managers() aren't re-exported from
@@ -1121,6 +1123,14 @@ if __name__ == "__main__":
     if run_mode == "tournament" and not has_llm_key():
         print("event=bot_skip reason=no_llm_key")
         sys.exit(0)
+
+    # OpenRouter credit preflight (project-backlog#675): free key lookup
+    # before any research/AskNews object is built. Skip only in tournament
+    # mode; guard failures never block the run.
+    _skip, _or_before = openrouter_guard.preflight()
+    if _skip and run_mode == "tournament":
+        sys.exit(0)
+    atexit.register(openrouter_guard.log_spend, _or_before)
 
     check_environment(strict=True)
     publish_to_metaculus = True
