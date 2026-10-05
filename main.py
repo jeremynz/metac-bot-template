@@ -294,10 +294,80 @@ def format_bot_cost_over_question_cap_line(
     )
 
 
+# Season rollover (project-backlog#773): the seasonal tournament id is explicit.
+# 33121 = Fall 2026 FutureEval (https://www.metaculus.com/tournament/fall-futureeval-2026/),
+# confirmed against the installed forecasting-tools constant FE_FALL_2026_ID
+# (MetaculusClient.CURRENT_AI_COMPETITION_ID). Season runs 2026-09-28..2027-01-06
+# (web-search snippets; the metaculus.com primary page was not fetchable).
+DEFAULT_TOURNAMENT_ID = "33121"
+
+
+def resolve_tournament_id(environ=None) -> "int | str":
+    """METACULUS_TOURNAMENT_ID env wins; else the pinned Fall 2026 default.
+
+    If the pinned default is empty/unusable we fall back to the
+    forecasting-tools constant and log a warning.
+    """
+    environ = os.environ if environ is None else environ
+    raw = (environ.get("METACULUS_TOURNAMENT_ID") or DEFAULT_TOURNAMENT_ID or "").strip()
+    if not raw:
+        fallback = MetaculusClient.CURRENT_AI_COMPETITION_ID
+        logger.warning(
+            "event=tournament_id_fallback id=%s reason=no_explicit_id", fallback
+        )
+        return fallback
+    return int(raw) if raw.isdigit() else raw
+
+
+def fetch_tournament_info(tournament_id, token=None, base_url="https://www.metaculus.com/api"):
+    """GET the project record for a tournament (network; mocked in tests)."""
+    import requests
+
+    headers = {"Authorization": f"Token {token}"} if token else {}
+    resp = requests.get(
+        f"{base_url}/projects/{tournament_id}/", headers=headers, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def check_tournament_open(tournament_id, fetch=fetch_tournament_info, now=None) -> None:
+    """Exit non-zero if the tournament's close/season-end date is in the past.
+
+    Looks at `forecasting_end_date` then `close_date` on the project record.
+    If the API exposes neither (or the fetch fails) it warns and proceeds.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        info = fetch(tournament_id)
+    except Exception as e:  # noqa: BLE001 - a flaky lookup must not block a run
+        logger.warning(
+            "event=tournament_expiry_check_skipped id=%s error=%r", tournament_id, e
+        )
+        return
+    for key in ("forecasting_end_date", "close_date"):
+        raw = info.get(key) if isinstance(info, dict) else None
+        if not raw:
+            continue
+        end = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end < now:
+            msg = (
+                f"event=tournament_expired id={tournament_id} {key}={raw} -- "
+                "tournament is closed; set METACULUS_TOURNAMENT_ID to the current season"
+            )
+            logger.error(msg)
+            sys.exit(msg)
+        return
+    logger.warning("event=tournament_expiry_check_skipped id=%s reason=no_date", tournament_id)
+
+
 def run_tournament_mode(
     template_bot: "FableForecastBot",
     client: MetaculusClient,
     run_cost_manager: MonetaryCostManager,
+    tournament_id=None,
 ) -> list:
     """
     Tournament-mode dispatch: two sequential forecast_on_tournament calls
@@ -320,7 +390,8 @@ def run_tournament_mode(
     """
     seasonal_tournament_reports = asyncio.run(
         template_bot.forecast_on_tournament(
-            client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            tournament_id if tournament_id is not None else client.CURRENT_AI_COMPETITION_ID,
+            return_exceptions=True
         )
     )
     if run_cost_manager.hard_limit and run_cost_manager.amount_left <= 0:
@@ -1272,8 +1343,12 @@ if __name__ == "__main__":
     # Gate G0 (<=US$0.40/question) is measured from the per-question and
     # run-total `event=bot_cost*` log lines emitted by
     # FableForecastBot._run_individual_question below.
+    tournament_id = resolve_tournament_id()
+    if run_mode == "tournament":
+        check_tournament_open(tournament_id, lambda t: fetch_tournament_info(t, os.getenv("METACULUS_TOKEN")))
     print(
-        f"Tournament ids: CURRENT_AI_COMPETITION_ID={MetaculusClient.CURRENT_AI_COMPETITION_ID} "
+        f"Tournament ids: METACULUS_TOURNAMENT_ID={tournament_id} "
+        f"CURRENT_AI_COMPETITION_ID={MetaculusClient.CURRENT_AI_COMPETITION_ID} "
         f"CURRENT_MINIBENCH_ID={MetaculusClient.CURRENT_MINIBENCH_ID}"
     )
 
@@ -1334,7 +1409,7 @@ if __name__ == "__main__":
     max_usd_per_run = get_max_usd_per_run()
     with MonetaryCostManager(hard_limit=max_usd_per_run) as run_cost_manager:
         if run_mode == "tournament":
-            forecast_reports = run_tournament_mode(template_bot, client, run_cost_manager)
+            forecast_reports = run_tournament_mode(template_bot, client, run_cost_manager, tournament_id)
         elif run_mode == "metaculus_cup":
             # The Metaculus Cup may be uninitialized near the start of a season
             # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
