@@ -116,3 +116,15 @@ question -- see `has_llm_key()` in `bot_helpers.py`.
   `poetry.lock` — bump the version pin in `pyproject.toml` only and say so;
   `poetry lock --no-update` is expected to run in CI/the install step
   before `poetry install`.
+
+## Season rollover
+
+Change one env value each season: `METACULUS_TOURNAMENT_ID` (repo variable
+`vars.METACULUS_TOURNAMENT_ID` in the workflow, or `.env` locally). Default
+`33121` = Fall 2026 FutureEval, confirmed from the installed
+forecasting-tools constant `MetaculusClient.FE_FALL_2026_ID` (season
+2026-09-28..2027-01-06 per web-search snippets; the metaculus.com primary page
+was not fetchable, so dates are unverified). The forecasting-tools constant
+is only a fallback (logs a warning). At startup in tournament mode, if the
+project's `forecasting_end_date`/`close_date` is in the past the run exits
+non-zero (`event=tournament_expired`).
