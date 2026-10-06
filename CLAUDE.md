@@ -128,3 +128,25 @@ was not fetchable, so dates are unverified). The forecasting-tools constant
 is only a fallback (logs a warning). At startup in tournament mode, if the
 project's `forecasting_end_date`/`close_date` is in the past the run exits
 non-zero (`event=tournament_expired`).
+
+## Experimental flags (default off; byte-for-byte unchanged when unset)
+
+Helpers live in `forecast_extras.py`; tests in `tests/test_extras.py`.
+- `METAC_OUTSIDE_VIEW=1`: in `run_research`, after the research call, one
+  summarizer-model (Haiku) call produces a reference class + base rate,
+  appended to the research text as an "Outside view" section so every
+  forecaster prompt sees it. Runs inside the question's cost manager, so it
+  is in `usd` of the `bot_cost` line and the run hard limit; skipped
+  (`event=outside_view_skipped`) if the run budget is already exhausted;
+  failures are logged and ignored.
+- `METAC_CALIBRATION=<json path>`: `FableForecastBot._aggregate_predictions`
+  applies `p' = sigmoid(a*logit(p)+b)` (params `{"a":..,"b":..}`) to the
+  aggregated binary forecast, re-clamped to 0.01-0.99. Unset/empty = identity.
+  Fit offline: `python3 scripts/fit_calibration.py pairs.csv > cal.json`
+  (CSV of `forecast,outcome`; stdlib, no network).
+
+### Measurement plan
+Run N MiniBench questions (N >= 30 preferred) per arm: baseline, outside-view
+on, calibration on (fit on prior resolved pairs only, never the eval set).
+Compare Brier and peer score vs baseline plus cost per question; keep a flag
+only if it improves the score and stays within the G0 cost cap.
