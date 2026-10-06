@@ -497,6 +497,15 @@ class _TokenUsageCallback(LitellmCustomLogger):
         )
 
 
+from forecast_extras import (  # noqa: E402
+    append_outside_view,
+    calibrate,
+    calibration_path,
+    outside_view_enabled,
+    outside_view_prompt,
+)
+
+
 class FableForecastBot(ForecastBot):
     """
     This is the template bot for Summer 2026 Metaculus AI Tournament.
@@ -774,10 +783,36 @@ class FableForecastBot(ForecastBot):
                 research = ""
             else:
                 research = await self.get_llm("researcher", "llm").invoke(prompt)
+            if outside_view_enabled() and _active_run_budget_exhausted() is not None:
+                logger.warning("event=outside_view_skipped reason=budget_exhausted")
+            elif outside_view_enabled():
+                # Flag-gated (#782): one cheap summarizer-model call, inside the
+                # same cost manager so it is counted in price_estimate / the
+                # bot_cost log line and the run hard limit.
+                try:
+                    ov = await self.get_llm("summarizer", "llm").invoke(
+                        outside_view_prompt(
+                            question.question_text,
+                            question.resolution_criteria,
+                            question.fine_print,
+                        )
+                    )
+                    research = append_outside_view(research, ov)
+                except HardLimitExceededError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"event=outside_view_failed error={e!r}")
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
     ##################################### BINARY QUESTIONS #####################################
+
+    async def _aggregate_predictions(self, predictions, question):
+        aggregate = await super()._aggregate_predictions(predictions, question)
+        path = calibration_path()
+        if path and isinstance(aggregate, float):
+            aggregate = max(0.01, min(0.99, calibrate(aggregate, path)))
+        return aggregate
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
