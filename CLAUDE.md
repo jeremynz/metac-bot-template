@@ -112,10 +112,11 @@ question -- see `has_llm_key()` in `bot_helpers.py`.
   module-level code only imports `forecasting_tools` and defines the
   class/helpers; the `if __name__ == "__main__":` block, which needs
   `METACULUS_TOKEN`/API keys, never runs on import).
-- A sandbox without `poetry` installed: don't try to regenerate
-  `poetry.lock` — bump the version pin in `pyproject.toml` only and say so;
-  `poetry lock --no-update` is expected to run in CI/the install step
-  before `poetry install`.
+- CI installs from the committed `poetry.lock` and never regenerates it. Any
+  `pyproject.toml` dependency change must commit a regenerated `poetry.lock`
+  in the same PR (`poetry lock`, Poetry 2.4.1 as CI uses; verify with
+  `poetry check --lock`). No poetry in the sandbox: `pip install --user
+  poetry==2.4.1` from PyPI rather than skipping the lock.
 
 ## Season rollover
 
