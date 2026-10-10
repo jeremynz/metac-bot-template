@@ -17,6 +17,7 @@ jobs:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     # Fleet runner HOME=/tmp is a 256 MB tmpfs: keep caches/venv in the workspace, skip pip cache.
     env:
+      TZ: UTC # fleet runner system tz resolves to an absolute path that pendulum/zoneinfo reject
       PIP_NO_CACHE_DIR: "1"
       POETRY_CACHE_DIR: ${{ github.workspace }}/.poetry-cache
       POETRY_VIRTUALENVS_PATH: ${{ github.workspace }}/.poetry-venvs
