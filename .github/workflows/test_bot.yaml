@@ -15,6 +15,11 @@ concurrency:
 jobs:
   tests:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    # Fleet runner HOME=/tmp is a 256 MB tmpfs: keep caches/venv in the workspace, skip pip cache.
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      POETRY_CACHE_DIR: ${{ github.workspace }}/.poetry-cache
+      POETRY_VIRTUALENVS_PATH: ${{ github.workspace }}/.poetry-venvs
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
